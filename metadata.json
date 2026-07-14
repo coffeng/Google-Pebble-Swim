@@ -1,0 +1,6 @@
+{
+  "name": "Pebble Data Grapher",
+  "description": "An interactive web app that connects to your Google Drive, searches for a folder named 'pebble', retrieves the longest sensor data JSON file containing accelerometer (xyz) and compass data, and displays it in beautiful charts for the first minute of recorded activity.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
