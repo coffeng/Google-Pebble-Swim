@@ -622,258 +622,172 @@ export default function App() {
     return strokes;
   }, [parseResult]);
 
-  // Algorithm to detect swim turn events across the entire session
-  // Uses stroke interval gaps as the primary turn signal.
-  // During swimming, strokes occur at regular intervals (0.7–2.5s).
-  // During a turn (glide → wall → push-off → glide), the gap between strokes
-  // is significantly longer (typically 3–8s). We detect turns by finding
-  // these abnormal gaps in the stroke rhythm, validated by a glide (low-activity) check.
+  // Algorithm to detect swim turn events using combined approach:
+  // 1. Primary: Stroke-interval gap analysis (best for freestyle)
+  // 2. Secondary: Template matching via NCC (catches breaststroke turns)
+  // Takes the union of both, then post-filters.
   const detectedTurns = useMemo(() => {
     if (!parseResult || parseResult.readings.length === 0) return [];
 
     const readings = parseResult.readings;
+    const sampleRateHz = parseResult.sampleRateHz || 10;
+    const turns: PebbleReading[] = [];
 
-    // Build pause regions to exclude
+    // Build pause regions
     const pauseRegions: { start: number; end: number }[] = [];
     if (parseResult.rawEvents) {
       for (let i = 0; i < parseResult.rawEvents.length; i++) {
         if (parseResult.rawEvents[i].type === 'pause') {
           const start = parseResult.rawEvents[i].timeOffsetMs;
           const resume = parseResult.rawEvents.find((e, j) => j > i && e.type === 'resume');
-          const end = resume ? resume.timeOffsetMs : Infinity;
-          pauseRegions.push({ start, end });
+          pauseRegions.push({ start, end: resume ? resume.timeOffsetMs : Infinity });
         }
       }
     }
-    function isDuringPause(timeMs: number) {
-      return pauseRegions.some(p => timeMs >= p.start && timeMs <= p.end);
-    }
+    function isDuringPause(t: number) { return pauseRegions.some(p => t >= p.start && t <= p.end); }
 
-    // Re-run stroke detection to get stroke times
-    const fullData = readings;
-    const smoothedData: { reading: PebbleReading; smoothMag: number }[] = [];
+    const MIN_TURN_INTERVAL = 22000;
+    const MIN_LAP_DURATION = 20000;
+
+    // === PRIMARY: Stroke-interval gap detection (v3 logic) ===
+    const smoothedData: number[] = [];
     const windowRadius = 4;
-    for (let i = 0; i < fullData.length; i++) {
-      let sum = 0, count = 0;
-      for (let j = Math.max(0, i - windowRadius); j <= Math.min(fullData.length - 1, i + windowRadius); j++) {
-        sum += fullData[j].magnitude; count++;
-      }
-      smoothedData.push({ reading: fullData[i], smoothMag: sum / count });
-    }
-    const smoothMags = smoothedData.map(s => s.smoothMag);
-    const avgMag = smoothMags.reduce((a, b) => a + b, 0) / smoothMags.length;
-    const maxMag = Math.max(...smoothMags);
-    const threshold = Math.max(1120, avgMag + (maxMag - avgMag) * 0.22);
-
-    const strokeTimes: number[] = [];
-    let lastStrokeTime = -Infinity;
-    for (let i = 1; i < smoothedData.length - 1; i++) {
-      const prev = smoothedData[i - 1].smoothMag;
-      const curr = smoothedData[i].smoothMag;
-      const next = smoothedData[i + 1].smoothMag;
-      if (curr > prev && curr > next && curr > threshold) {
-        const timeOffset = smoothedData[i].reading.timeOffset;
-        if (timeOffset - lastStrokeTime >= 700) {
-          strokeTimes.push(timeOffset);
-          lastStrokeTime = timeOffset;
-        }
-      }
-    }
-
-    if (strokeTimes.length < 4) return [];
-
-    // Precompute smoothed magnitude for glide validation
-    const sampleRateHz = parseResult.sampleRateHz || 10;
-    const glideWindowSamples = Math.round(sampleRateHz * 1.0);
-    const smoothedMagArr: number[] = [];
     for (let i = 0; i < readings.length; i++) {
       let sum = 0, count = 0;
-      const start = Math.max(0, i - glideWindowSamples);
-      const end = Math.min(readings.length - 1, i + glideWindowSamples);
-      for (let j = start; j <= end; j++) { sum += readings[j].magnitude; count++; }
-      smoothedMagArr.push(sum / count);
-    }
-    const overallAvgMag = smoothedMagArr.reduce((a, b) => a + b, 0) / smoothedMagArr.length;
-
-    function hasGlideInRange(startMs: number, endMs: number): boolean {
-      const sampleSpacing = 1000 / sampleRateHz;
-      const startIdx = Math.max(0, Math.floor(startMs / sampleSpacing));
-      const endIdx = Math.min(readings.length - 1, Math.ceil(endMs / sampleSpacing));
-      if (endIdx - startIdx < 3) return false;
-      let minMag = Infinity;
-      for (let i = startIdx; i <= endIdx; i++) {
-        if (smoothedMagArr[i] < minMag) minMag = smoothedMagArr[i];
+      for (let j = Math.max(0, i - windowRadius); j <= Math.min(readings.length - 1, i + windowRadius); j++) {
+        sum += readings[j].magnitude; count++;
       }
-      return minMag < overallAvgMag * 0.88;
+      smoothedData.push(sum / count);
     }
+    const avgMag = smoothedData.reduce((a, b) => a + b, 0) / smoothedData.length;
+    const maxMag = Math.max(...smoothedData);
+    const strokeThreshold = Math.max(1120, avgMag + (maxMag - avgMag) * 0.22);
 
-    // Compute inter-stroke intervals (excluding pauses)
-    const intervals: { gapMs: number; afterStrokeIdx: number }[] = [];
-    for (let i = 1; i < strokeTimes.length; i++) {
-      const gapMs = strokeTimes[i] - strokeTimes[i - 1];
-      const midpoint = (strokeTimes[i] + strokeTimes[i - 1]) / 2;
-      if (!isDuringPause(midpoint)) {
-        intervals.push({ gapMs, afterStrokeIdx: i - 1 });
+    const strokeTimes: number[] = [];
+    let lastStroke = -Infinity;
+    for (let i = 1; i < smoothedData.length - 1; i++) {
+      if (smoothedData[i] > smoothedData[i-1] && smoothedData[i] > smoothedData[i+1] && smoothedData[i] > strokeThreshold) {
+        const t = readings[i].timeOffset;
+        if (t - lastStroke >= 700) { strokeTimes.push(t); lastStroke = t; }
       }
     }
 
-    const MEDIAN_WINDOW = 4;
-    const MIN_TURN_GAP_RATIO = 1.3;
-    const MIN_TURN_GAP_ABS = 1800;
-    const MIN_TURN_INTERVAL = 22000;
-
-    // Score each interval
-    const scored = intervals.map((interval, i) => {
-      const nearbyIntervals: number[] = [];
-      for (let j = Math.max(0, i - MEDIAN_WINDOW); j <= Math.min(intervals.length - 1, i + MEDIAN_WINDOW); j++) {
-        if (j !== i) nearbyIntervals.push(intervals[j].gapMs);
+    const primaryTurns: number[] = [];
+    if (strokeTimes.length >= 4) {
+      // Glide validation
+      const glideWin = Math.round(sampleRateHz * 1.0);
+      const smoothedMagArr: number[] = [];
+      for (let i = 0; i < readings.length; i++) {
+        let sum = 0, count = 0;
+        for (let j = Math.max(0, i - glideWin); j <= Math.min(readings.length - 1, i + glideWin); j++) { sum += readings[j].magnitude; count++; }
+        smoothedMagArr.push(sum / count);
       }
-      if (nearbyIntervals.length < 2) return { ...interval, score: 0 };
-      const sorted = [...nearbyIntervals].sort((a, b) => a - b);
-      const p25Idx = Math.floor(sorted.length * 0.15);
-      const baseline = sorted[p25Idx];
-      const ratio = interval.gapMs / Math.max(baseline, 500);
-      return { ...interval, score: ratio };
-    });
+      const overallAvg = smoothedMagArr.reduce((a, b) => a + b, 0) / smoothedMagArr.length;
 
-    // Select turns
-    const turns: PebbleReading[] = [];
-    const turnTimes: number[] = [];
-    let lastTurnTimeMs = -Infinity;
-
-    for (const s of scored) {
-      if (s.gapMs < MIN_TURN_GAP_ABS) continue;
-      if (s.score < MIN_TURN_GAP_RATIO) continue;
-
-      const gapStart = strokeTimes[s.afterStrokeIdx];
-      const gapEnd = strokeTimes[s.afterStrokeIdx + 1];
-
-      if (!hasGlideInRange(gapStart, gapEnd)) continue;
-
-      const turnTimeMs = (gapStart + gapEnd) / 2;
-      if (isDuringPause(turnTimeMs)) continue;
-
-      if (turnTimeMs - lastTurnTimeMs >= MIN_TURN_INTERVAL) {
-        turnTimes.push(turnTimeMs);
-        lastTurnTimeMs = turnTimeMs;
+      function hasGlide(startMs: number, endMs: number): boolean {
+        const sp = 1000 / sampleRateHz;
+        const si = Math.max(0, Math.floor(startMs / sp));
+        const ei = Math.min(readings.length - 1, Math.ceil(endMs / sp));
+        if (ei - si < 3) return false;
+        let min = Infinity;
+        for (let i = si; i <= ei; i++) { if (smoothedMagArr[i] < min) min = smoothedMagArr[i]; }
+        return min < overallAvg * 0.88;
       }
-    }
 
-    // Post-filter: remove turns that create laps shorter than 20s
-    const MIN_LAP_DURATION = 20000;
-    const filteredTimes: number[] = [];
-    for (let i = 0; i < turnTimes.length; i++) {
-      const prevTime = filteredTimes.length > 0 ? filteredTimes[filteredTimes.length - 1] : 0;
-      const nextTime = i < turnTimes.length - 1 ? turnTimes[i + 1] : readings[readings.length - 1].timeOffset;
-      const lapBefore = turnTimes[i] - prevTime;
-      const lapAfter = nextTime - turnTimes[i];
-      if (lapBefore >= MIN_LAP_DURATION && lapAfter >= MIN_LAP_DURATION) {
-        filteredTimes.push(turnTimes[i]);
+      const intervals: { gapMs: number; afterIdx: number }[] = [];
+      for (let i = 1; i < strokeTimes.length; i++) {
+        const gap = strokeTimes[i] - strokeTimes[i-1];
+        const mid = (strokeTimes[i] + strokeTimes[i-1]) / 2;
+        if (!isDuringPause(mid)) intervals.push({ gapMs: gap, afterIdx: i - 1 });
+      }
+
+      let lastT = -Infinity;
+      for (let idx = 0; idx < intervals.length; idx++) {
+        const iv = intervals[idx];
+        const nearby: number[] = [];
+        for (let j = Math.max(0, idx - 4); j <= Math.min(intervals.length - 1, idx + 4); j++) {
+          if (j !== idx) nearby.push(intervals[j].gapMs);
+        }
+        if (nearby.length < 2) continue;
+        const sorted = [...nearby].sort((a, b) => a - b);
+        const baseline = sorted[Math.floor(sorted.length * 0.15)];
+        const score = iv.gapMs / Math.max(baseline, 500);
+
+        if (iv.gapMs < 1800 || score < 1.3) continue;
+        const gs = strokeTimes[iv.afterIdx];
+        const ge = strokeTimes[iv.afterIdx + 1];
+        if (!hasGlide(gs, ge)) continue;
+        const t = (gs + ge) / 2;
+        if (isDuringPause(t)) continue;
+        if (t - lastT >= MIN_TURN_INTERVAL) { primaryTurns.push(t); lastT = t; }
       }
     }
 
-    // SECONDARY: Y-variance + Z-variance detector for breaststroke turns.
-    // Breaststroke turns show a burst of high-frequency Y oscillations and 
-    // increased Z amplitude. We detect this as a spike in combined Y+Z standard
-    // deviation in short (1.5s) windows compared to local baseline.
-    // Additionally, we detect Z-range spikes (hand diving below surface during turn).
-    const SEC_WINDOW = Math.round(sampleRateHz * 1.5); // 1.5s analysis window
-    const SEC_STEP = Math.round(sampleRateHz * 0.5); // 0.5s step
-    const SEC_COMBINED_RATIO = 1.55; // Combined Y+Z std must be 1.55× local baseline
-    const SEC_ZRANGE_RATIO = 1.4; // Z range must be 1.4× local baseline
-    const SEC_MIN_INTERVAL = 22000;
+    // === SECONDARY: Template matching via NCC ===
+    const TMPL_HALF = 30;
+    const tmplX = [1.262,1.2015,0.8499,0.5771,0.8834,1.0672,1.014,0.9055,1.0079,0.8365,0.4998,0.4237,0.1498,0.4606,0.4714,0.3158,0.2287,-0.0434,0.0498,0.1877,-0.0198,-0.4668,-0.5839,-0.7664,-0.7744,-0.647,-1.0039,-0.8652,-1.2101,-1.3497,-1.4655,-1.5479,-1.6141,-1.5129,-1.3756,-1.4098,-1.4419,-1.3192,-0.6942,-0.2204,0.0403,0.3652,0.3327,0.4469,0.6098,0.5499,0.8131,0.4757,0.7135,0.5694,0.6556,0.6736,0.7979,0.8055,0.9254,0.9124,0.9613,0.9476,0.7506,0.9262,0.7677];
+    const tmplY = [1.7975,-0.2381,-0.5626,0.8269,2.1494,1.7825,2.2596,0.6357,-0.176,-1.2768,-1.3065,0.0015,1.7007,1.461,-0.3765,-0.5455,-0.3085,0.7225,0.7478,0.2236,-0.178,-0.3614,-0.2206,-0.5427,0.2105,0.3442,0.1199,-0.3653,-0.7752,-0.4003,0.1478,0.3553,-0.2207,-0.4685,-0.5052,0.2321,0.7041,0.3269,-0.5668,-0.5364,0.3,-0.0007,0.0755,-0.3416,-0.3386,-0.165,0.5193,-0.2014,-0.2553,-0.5131,-0.3539,-0.4651,-0.2037,-0.3254,-0.2979,-0.5127,-0.3704,-0.6629,-0.9027,-0.3837,-0.6888];
+    const tmplZ = [0.0128,0.2004,0.2717,-0.2631,0.3609,0.6301,0.3383,0.1598,0.4469,1.238,1.2786,0.5882,0.1003,0.9133,1.0645,0.7474,0.9949,1.1289,0.7818,0.0543,-0.3199,-0.4563,-0.5457,-0.4479,-0.7,-0.5741,-0.6779,-0.3994,-1.0174,-1.2589,-0.9879,-1.1279,-1.0571,-0.5577,-0.5024,-0.4916,-0.5891,-0.6741,-0.3428,0.1027,0.3129,0.3429,0.3574,-0.0655,-0.2427,-0.0267,0.1527,0.6075,0.4479,0.3086,0.3098,0.399,0.0825,0.2091,0.6021,0.6327,0.4773,0.4227,-0.0523,-0.1437,0.1389];
+    const tmplMag = [2.726,2.8112,1.2196,1.1065,1.6529,1.0713,1.7942,1.2588,0.9562,-0.2034,-0.5312,-0.2506,0.6927,0.5814,-0.0419,-0.0894,0.0723,0.6372,0.3858,-0.4225,-0.3648,-0.4785,-0.3133,-0.4653,-0.2434,-0.1316,-0.3414,-0.2923,-0.7457,-1.0104,-0.808,-0.8785,-0.9413,-0.6389,-0.4958,-0.3998,-0.4766,-0.6,-0.1653,0.3128,0.3127,0.4143,0.2575,-0.0289,0.0091,-0.0327,0.377,0.0695,0.2147,0.1073,0.1479,0.0972,0.1624,0.2049,0.372,0.4034,0.2728,0.2058,-0.0499,0.2247,0.0736];
 
-    const secMetrics: { timeMs: number; combined: number; zRange: number; magMin: number }[] = [];
-    for (let i = SEC_WINDOW; i < readings.length - SEC_WINDOW; i += SEC_STEP) {
-      const ws = i - Math.floor(SEC_WINDOW / 2);
-      const we = i + Math.floor(SEC_WINDOW / 2);
-
-      // Y std dev
-      let ySum = 0;
-      for (let j = ws; j < we; j++) ySum += readings[j].y;
-      const yMean = ySum / (we - ws);
-      let yVar = 0;
-      for (let j = ws; j < we; j++) yVar += (readings[j].y - yMean) ** 2;
-      const yStd = Math.sqrt(yVar / (we - ws));
-
-      // Z std dev and range
-      let zSum = 0, zMin = Infinity, zMax = -Infinity;
-      for (let j = ws; j < we; j++) {
-        zSum += readings[j].z;
-        if (readings[j].z < zMin) zMin = readings[j].z;
-        if (readings[j].z > zMax) zMax = readings[j].z;
-      }
-      const zMean = zSum / (we - ws);
-      let zVar = 0;
-      for (let j = ws; j < we; j++) zVar += (readings[j].z - zMean) ** 2;
-      const zStd = Math.sqrt(zVar / (we - ws));
-
-      // Mag min in window
-      let magMin = Infinity;
-      for (let j = ws; j < we; j++) { if (readings[j].magnitude < magMin) magMin = readings[j].magnitude; }
-
-      secMetrics.push({ timeMs: readings[i].timeOffset, combined: yStd + zStd, zRange: zMax - zMin, magMin });
+    function ncc(sig: number[], tmpl: number[]): number {
+      const n = tmpl.length;
+      const sm = sig.reduce((s, v) => s + v, 0) / n;
+      const ss = Math.sqrt(sig.reduce((s, v) => s + (v - sm) ** 2, 0) / n) || 1;
+      const tm = tmpl.reduce((s, v) => s + v, 0) / n;
+      const ts = Math.sqrt(tmpl.reduce((s, v) => s + (v - tm) ** 2, 0) / n) || 1;
+      let sum = 0;
+      for (let i = 0; i < n; i++) sum += ((sig[i] - sm) / ss) * ((tmpl[i] - tm) / ts);
+      return sum / n;
     }
 
-    // Find peaks that exceed local baseline
-    const SEC_NEIGHBORHOOD = 16;
-    let lastSecTurn = -Infinity;
+    const NCC_STEP = sampleRateHz;
+    const NCC_THRESHOLD = 0.25;
+    const nccTurns: number[] = [];
 
-    for (let i = SEC_NEIGHBORHOOD; i < secMetrics.length - SEC_NEIGHBORHOOD; i++) {
-      const curr = secMetrics[i];
-      const timeMs = curr.timeMs;
+    const scores: { timeMs: number; score: number }[] = [];
+    for (let i = TMPL_HALF; i < readings.length - TMPL_HALF; i += NCC_STEP) {
+      const sigX: number[] = [], sigY: number[] = [], sigZ: number[] = [], sigMag: number[] = [];
+      for (let j = i - TMPL_HALF; j <= i + TMPL_HALF; j++) {
+        sigX.push(readings[j].x); sigY.push(readings[j].y); sigZ.push(readings[j].z); sigMag.push(readings[j].magnitude);
+      }
+      const score = (ncc(sigMag, tmplMag) + ncc(sigZ, tmplZ) + ncc(sigY, tmplY) + ncc(sigX, tmplX)) / 4;
+      scores.push({ timeMs: readings[i].timeOffset, score });
+    }
 
-      if (isDuringPause(timeMs)) continue;
-      if (filteredTimes.some(t => Math.abs(t - timeMs) < SEC_MIN_INTERVAL)) continue;
-      if (timeMs - lastSecTurn < SEC_MIN_INTERVAL) continue;
-      if (timeMs < 20000 || timeMs > readings[readings.length - 1].timeOffset - 10000) continue;
-
-      // Must be a local maximum in combined OR zRange
-      const isLocalMaxCombined = (i === 0 || secMetrics[i-1].combined < curr.combined) && 
-                                  (i === secMetrics.length-1 || secMetrics[i+1].combined < curr.combined);
-      const isLocalMaxZRange = (i === 0 || secMetrics[i-1].zRange < curr.zRange) && 
-                                (i === secMetrics.length-1 || secMetrics[i+1].zRange < curr.zRange);
-      
-      if (!isLocalMaxCombined && !isLocalMaxZRange) continue;
-
-      // Compute local baseline (excluding ±4 windows around current point)
-      let baseCombined = 0, baseZRange = 0, baseCount = 0;
-      for (let j = i - SEC_NEIGHBORHOOD; j <= i + SEC_NEIGHBORHOOD; j++) {
-        if (j >= 0 && j < secMetrics.length && Math.abs(j - i) > 4) {
-          baseCombined += secMetrics[j].combined;
-          baseZRange += secMetrics[j].zRange;
-          baseCount++;
+    let lastNCC = -Infinity;
+    for (let i = 1; i < scores.length - 1; i++) {
+      if (scores[i].score > scores[i-1].score && scores[i].score > scores[i+1].score && scores[i].score > NCC_THRESHOLD) {
+        const t = scores[i].timeMs;
+        if (t - lastNCC >= MIN_TURN_INTERVAL && !isDuringPause(t) && t > 20000 && t < parseResult.totalDurationMs - 10000) {
+          nccTurns.push(t);
+          lastNCC = t;
         }
       }
-      if (baseCount === 0) continue;
-      const avgCombined = baseCombined / baseCount;
-      const avgZRange = baseZRange / baseCount;
+    }
 
-      // Detection criteria: EITHER high combined Y+Z std OR high Z range with low magMin
-      const combinedPass = curr.combined > avgCombined * SEC_COMBINED_RATIO;
-      const zRangePass = curr.zRange > avgZRange * SEC_ZRANGE_RATIO && curr.magMin < overallAvgMag * 0.85;
+    // === COMBINE: Union of primary and NCC turns ===
+    const combined = [...primaryTurns];
+    for (const t of nccTurns) {
+      // Add NCC turn if it's not near an existing primary turn
+      if (!combined.some(ct => Math.abs(ct - t) < MIN_TURN_INTERVAL)) {
+        combined.push(t);
+      }
+    }
+    combined.sort((a, b) => a - b);
 
-      if (combinedPass || zRangePass) {
-        filteredTimes.push(timeMs);
-        lastSecTurn = timeMs;
+    // Post-filter: minimum lap duration
+    const filteredTimes: number[] = [];
+    for (let i = 0; i < combined.length; i++) {
+      const prev = filteredTimes.length > 0 ? filteredTimes[filteredTimes.length - 1] : 0;
+      const next = i < combined.length - 1 ? combined[i + 1] : parseResult.totalDurationMs;
+      if (combined[i] - prev >= MIN_LAP_DURATION && next - combined[i] >= MIN_LAP_DURATION) {
+        filteredTimes.push(combined[i]);
       }
     }
 
-    // Re-sort and re-apply lap duration filter
-    filteredTimes.sort((a, b) => a - b);
-    const finalTimes: number[] = [];
-    for (let i = 0; i < filteredTimes.length; i++) {
-      const prevTime = finalTimes.length > 0 ? finalTimes[finalTimes.length - 1] : 0;
-      const nextTime = i < filteredTimes.length - 1 ? filteredTimes[i + 1] : readings[readings.length - 1].timeOffset;
-      const lapBefore = filteredTimes[i] - prevTime;
-      const lapAfter = nextTime - filteredTimes[i];
-      if (lapBefore >= MIN_LAP_DURATION && lapAfter >= MIN_LAP_DURATION) {
-        finalTimes.push(filteredTimes[i]);
-      }
-    }
-
-    // Map turn times to nearest readings
-    for (const turnTimeMs of finalTimes) {
+    // Map to nearest readings
+    for (const turnTimeMs of filteredTimes) {
       let closest = readings[0];
       let minDiff = Math.abs(readings[0].timeOffset - turnTimeMs);
       for (let k = 1; k < readings.length; k++) {
