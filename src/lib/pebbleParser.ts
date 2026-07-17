@@ -3,31 +3,76 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { PebbleReading, ParseResult } from '../types';
+import { PebbleReading, ParseResult, RawEvent } from '../types';
+
+/**
+ * Parse a time string like "14:25.520" or "19:0.800" into milliseconds.
+ */
+function parseTimeString(timeStr: string): number {
+  // Format: "MM:SS.mmm" or "M:S.m"
+  const match = timeStr.match(/^(\d+):(\d+)\.(\d+)$/);
+  if (!match) return 0;
+  const minutes = parseInt(match[1], 10);
+  const seconds = parseInt(match[2], 10);
+  // Pad or trim milliseconds to 3 digits
+  let msStr = match[3];
+  if (msStr.length < 3) msStr = msStr.padEnd(3, '0');
+  else if (msStr.length > 3) msStr = msStr.slice(0, 3);
+  const ms = parseInt(msStr, 10);
+  return minutes * 60000 + seconds * 1000 + ms;
+}
 
 /**
  * Robustly parses Pebble JSON sensor data.
  * Handles arrays of objects, nested data fields, and detects various accelerometer & compass property names.
+ * Also handles the v19+ format where `raw` contains interleaved data arrays and event objects.
  */
 export function parsePebbleJson(json: any): ParseResult {
   let rawList: any[] = [];
-  
+  const rawEvents: RawEvent[] = [];
+  let explicitSampleRate: number | undefined = undefined;
   // 1. Identify the list of readings from the JSON object
   if (Array.isArray(json)) {
     rawList = json;
   } else if (json && typeof json === 'object') {
-    // Look for nested arrays that might contain the data
-    const possibleKeys = ['data', 'readings', 'samples', 'accel', 'sensor', 'sensors', 'logs', 'records', 'values'];
-    for (const key of possibleKeys) {
-      if (Array.isArray(json[key])) {
-        rawList = json[key];
-        break;
+    // Check for explicit sample rate
+    if (typeof json.raw_hz === 'number') {
+      explicitSampleRate = json.raw_hz;
+    }
+
+    // Check for `raw` array (v19+ pebble-swim-tracker format)
+    // This array can contain both data arrays and inline event objects
+    if (Array.isArray(json.raw)) {
+      for (const item of json.raw) {
+        if (Array.isArray(item)) {
+          // Data sample: [x, y, z, compass?]
+          rawList.push(item);
+        } else if (item && typeof item === 'object' && item.type) {
+          // Inline event: {"type": "pause", "time": "14:25.520"}
+          rawEvents.push({
+            type: item.type,
+            time: item.time || '',
+            timeOffsetMs: item.time ? parseTimeString(item.time) : 0
+          });
+        }
+      }
+    }
+
+    // If no raw array found, look for other nested arrays
+    if (rawList.length === 0) {
+      const possibleKeys = ['data', 'readings', 'samples', 'accel', 'sensor', 'sensors', 'logs', 'records', 'values'];
+      for (const key of possibleKeys) {
+        if (Array.isArray(json[key])) {
+          rawList = json[key];
+          break;
+        }
       }
     }
     
     // If no explicit list found, find any key that contains an array of arrays, objects, or primitive lists
     if (rawList.length === 0) {
       for (const key in json) {
+        if (key === 'events' || key === 'laps') continue; // Skip log/metadata arrays
         if (Array.isArray(json[key]) && json[key].length > 0) {
           rawList = json[key];
           break;
@@ -47,7 +92,8 @@ export function parsePebbleJson(json: any): ParseResult {
       hasAccelerometer: false,
       hasCompass: false,
       detectedFields: [],
-      totalDurationMs: 0
+      totalDurationMs: 0,
+      rawEvents
     };
   }
 
@@ -225,9 +271,10 @@ export function parsePebbleJson(json: any): ParseResult {
     });
   } else {
     // Generate sequential artificial time offsets
-    sampleRateHz = 25; // Assume 25Hz default
+    sampleRateHz = explicitSampleRate || 25; // Use explicit rate from JSON or assume 25Hz
+    const sampleSpacingMs = 1000 / sampleRateHz;
     intermediateReadings.forEach((reading, index) => {
-      const timeOffset = index * defaultSampleSpacingMs;
+      const timeOffset = index * sampleSpacingMs;
       const magnitude = parseFloat(Math.sqrt(reading.x * reading.x + reading.y * reading.y + reading.z * reading.z).toFixed(2));
 
       readings.push({
@@ -260,9 +307,10 @@ export function parsePebbleJson(json: any): ParseResult {
     readings,
     hasAccelerometer,
     hasCompass,
-    sampleRateHz,
+    sampleRateHz: explicitSampleRate || sampleRateHz,
     detectedFields: Array.from(detectedFields),
-    totalDurationMs
+    totalDurationMs,
+    rawEvents
   };
 }
 

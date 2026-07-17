@@ -31,6 +31,13 @@ export interface PebbleReading {
   magZ?: number;         // Optional raw magnetometer Z
 }
 
+/** An inline event found within the raw data stream (e.g. pause/resume). */
+export interface RawEvent {
+  type: string;          // "pause" or "resume"
+  time: string;          // Formatted time string from the file (e.g., "14:25.520")
+  timeOffsetMs: number;  // Computed offset in milliseconds from start
+}
+
 export interface ParseResult {
   readings: PebbleReading[];
   hasAccelerometer: boolean;
@@ -38,4 +45,5 @@ export interface ParseResult {
   sampleRateHz?: number;
   detectedFields: string[];
   totalDurationMs: number;
+  rawEvents: RawEvent[];  // Inline events (pause/resume) found in the raw data
 }

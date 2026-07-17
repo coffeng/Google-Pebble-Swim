@@ -35,11 +35,12 @@ import {
   Legend, 
   AreaChart, 
   Area,
-  ReferenceLine
+  ReferenceLine,
+  ReferenceArea
 } from 'recharts';
 import { User as FirebaseUser } from 'firebase/auth';
 
-import { DriveFile, DriveFolder, PebbleReading, ParseResult } from './types';
+import { DriveFile, DriveFolder, PebbleReading, ParseResult, RawEvent } from './types';
 import { 
   initAuth, 
   googleSignIn, 
@@ -48,7 +49,10 @@ import {
   listPebbleJsonFiles, 
   downloadFileContent 
 } from './lib/googleDrive';
+import { isLocalServerAvailable, listLocalFiles, downloadLocalFile, loadAnnotations, saveAnnotations, AnnotationData } from './lib/localFiles';
 import { parsePebbleJson, formatTimeOffset } from './lib/pebbleParser';
+
+type DataSource = 'local' | 'drive';
 
 // --- Swim Stroke Classifier ported from pebble-swim-tracker ---
 enum StrokeType {
@@ -181,6 +185,10 @@ function stroke_classify_features(f: StrokeFeatures, prev: StrokeType): StrokeTy
 }
 
 export default function App() {
+  // Data source: 'local' for local file server, 'drive' for Google Drive
+  const [dataSource, setDataSource] = useState<DataSource>('local');
+  const [localAvailable, setLocalAvailable] = useState<boolean>(false);
+
   // Authentication states
   const [user, setUser] = useState<FirebaseUser | null>(null);
   const [token, setToken] = useState<string | null>(null);
@@ -202,30 +210,133 @@ export default function App() {
   const [parseResult, setParseResult] = useState<ParseResult | null>(null);
 
   // UI Control states
-  const [timeWindow, setTimeWindow] = useState<'first-minute' | 'full'>('first-minute');
+  const [timeWindow, setTimeWindow] = useState<'first-minute' | 'full'>('full');
+  const [zoomDurationSec, setZoomDurationSec] = useState<number>(300);
+  const [zoomPositionPct, setZoomPositionPct] = useState<number>(0);
   const [hoverReading, setHoverReading] = useState<PebbleReading | null>(null);
+  const hoverReadingRef = useRef<PebbleReading | null>(null);
+
+  const updateHoverReading = (reading: PebbleReading) => {
+    hoverReadingRef.current = reading;
+    setHoverReading(reading);
+  };
   const [activeTab, setActiveTab] = useState<'charts' | 'stats' | 'raw'>('charts');
 
-  // Sync auth state on load
+  // Annotation states
+  const [annotateMode, setAnnotateMode] = useState<boolean>(false);
+  const [annotations, setAnnotations] = useState<AnnotationData>({ turns: [] });
+  const [editingAnnotationIdx, setEditingAnnotationIdx] = useState<number | null>(null);
+  const [annotatedFiles, setAnnotatedFiles] = useState<Set<string>>(new Set()); // Index of annotation being edited
+
+  // Playback states
+  const [isPlaying, setIsPlaying] = useState<boolean>(false);
+  const [playbackSpeed, setPlaybackSpeed] = useState<number>(5); // multiplier (1=realtime, 5=5x, etc)
+  const [playheadMs, setPlayheadMs] = useState<number>(0);
+  const playheadRef = useRef<number>(0);
+  const animFrameRef = useRef<number>(0);
+  const lastFrameTimeRef = useRef<number>(0);
+
+  // On mount: detect if local file server is available (Windows desktop mode)
+  // If available, use local files by default and skip Google auth entirely.
   useEffect(() => {
-    const unsubscribe = initAuth(
-      (currentUser, accessToken) => {
-        setUser(currentUser);
-        setToken(accessToken);
+    let cancelled = false;
+    const detect = async () => {
+      const available = await isLocalServerAvailable();
+      if (cancelled) return;
+      setLocalAvailable(available);
+      if (available) {
+        setDataSource('local');
         setNeedsAuth(false);
         setIsLoadingAuth(false);
-      },
-      () => {
-        setUser(null);
-        setToken(null);
-        setNeedsAuth(true);
-        setIsLoadingAuth(false);
+        loadLocalData();
+      } else {
+        // Fall back to Google Drive mode
+        setDataSource('drive');
+        const unsubscribe = initAuth(
+          (currentUser, accessToken) => {
+            setUser(currentUser);
+            setToken(accessToken);
+            setNeedsAuth(false);
+            setIsLoadingAuth(false);
+          },
+          () => {
+            setUser(null);
+            setToken(null);
+            setNeedsAuth(true);
+            setIsLoadingAuth(false);
+          }
+        );
+        return unsubscribe;
       }
-    );
-    return () => unsubscribe();
+    };
+    const cleanup = detect();
+    return () => {
+      cancelled = true;
+      // If detect returned an unsubscribe function, call it
+      cleanup?.then?.(unsub => unsub?.());
+    };
   }, []);
 
-  // Fetch folders and files once authenticated
+  // Load files from local server
+  const loadLocalData = async () => {
+    setIsLoadingDrive(true);
+    setDriveError(null);
+    try {
+      const localFiles = await listLocalFiles();
+      setFiles(localFiles);
+
+      // Check which files have annotations
+      const annotated = new Set<string>();
+      for (const f of localFiles) {
+        const anno = await loadAnnotations(f.id);
+        if (anno.turns.length > 0) annotated.add(f.id);
+      }
+      setAnnotatedFiles(annotated);
+
+      // Auto-select the largest file
+      if (localFiles.length > 0) {
+        handleSelectLocalFile(localFiles[0]);
+      }
+    } catch (err: any) {
+      console.error('Error loading local files:', err);
+      setDriveError(err.message || 'Failed to load local files.');
+    } finally {
+      setIsLoadingDrive(false);
+    }
+  };
+
+  // Fetch and parse a local file
+  const handleSelectLocalFile = async (file: DriveFile) => {
+    setSelectedFile(file);
+    setIsLoadingFile(true);
+    setFileError(null);
+    setHoverReading(null);
+
+    try {
+      const data = await downloadLocalFile(file.id);
+      setRawJson(data);
+      const parsed = parsePebbleJson(data);
+      setParseResult(parsed);
+      setTimeWindow('full');
+      if (parsed) {
+        const totalSecs = Math.round(parsed.totalDurationMs / 1000);
+        setZoomDurationSec(totalSecs);
+        setZoomPositionPct(0);
+      }
+      // Load annotations for this file
+      const anno = await loadAnnotations(file.id);
+      setAnnotations(anno);
+    } catch (err: any) {
+      console.error('Error loading local file:', err);
+      setFileError(err.message || 'Could not load or parse this JSON file.');
+      setParseResult(null);
+      setRawJson(null);
+    } finally {
+      setIsLoadingFile(false);
+    }
+  };
+
+  // Fetch folders and files once authenticated (Google Drive mode)
   const loadDriveData = async (accessToken: string) => {
     setIsLoadingDrive(true);
     setDriveError(null);
@@ -260,17 +371,42 @@ export default function App() {
 
   // Re-fetch files manually
   const handleRefreshDrive = () => {
-    if (token) {
+    if (dataSource === 'local') {
+      loadLocalData();
+    } else if (token) {
       loadDriveData(token);
     }
   };
 
-  // Trigger loading drive data once token changes
+  // Trigger loading drive data once token changes (only in drive mode)
   useEffect(() => {
-    if (token) {
+    if (dataSource === 'drive' && token) {
       loadDriveData(token);
     }
-  }, [token]);
+  }, [token, dataSource]);
+
+  // Switch data source
+  const handleSwitchSource = (source: DataSource) => {
+    setDataSource(source);
+    setFiles([]);
+    setSelectedFile(null);
+    setParseResult(null);
+    setRawJson(null);
+    setDriveError(null);
+    setFileError(null);
+
+    if (source === 'local') {
+      setNeedsAuth(false);
+      loadLocalData();
+    } else {
+      // Re-init Google auth
+      if (token) {
+        loadDriveData(token);
+      } else {
+        setNeedsAuth(true);
+      }
+    }
+  };
 
   // Handle Sign-In click
   const handleLogin = async () => {
@@ -306,8 +442,12 @@ export default function App() {
     }
   };
 
-  // Fetch and parse file content
+  // Fetch and parse file content (Google Drive mode)
   const handleSelectFile = async (file: DriveFile, currentToken?: string) => {
+    if (dataSource === 'local') {
+      return handleSelectLocalFile(file);
+    }
+
     const activeToken = currentToken || token;
     if (!activeToken) return;
 
@@ -322,8 +462,13 @@ export default function App() {
       const parsed = parsePebbleJson(data);
       setParseResult(parsed);
       
-      // Default to first-minute view
-      setTimeWindow('first-minute');
+      // Default to full session view
+      setTimeWindow('full');
+      if (parsed) {
+        const totalSecs = Math.round(parsed.totalDurationMs / 1000);
+        setZoomDurationSec(totalSecs);
+        setZoomPositionPct(0);
+      }
     } catch (err: any) {
       console.error('Error downloading/parsing file:', err);
       setFileError(err.message || 'Could not download or parse this JSON file. Ensure it is valid sensor data.');
@@ -343,6 +488,15 @@ export default function App() {
     // Filter to first minute (60,000 ms)
     if (timeWindow === 'first-minute') {
       filtered = filtered.filter(r => r.timeOffset <= 60000);
+    } else {
+      const totalDurationMs = parseResult.totalDurationMs;
+      const zoomDurationMs = zoomDurationSec * 1000;
+      
+      const maxStartMs = Math.max(0, totalDurationMs - zoomDurationMs);
+      const startMs = (zoomPositionPct / 100) * maxStartMs;
+      const endMs = startMs + zoomDurationMs;
+      
+      filtered = filtered.filter(r => r.timeOffset >= startMs && r.timeOffset <= endMs);
     }
 
     // Downsample full dataset if it is too massive to prevent browser/Recharts SVG rendering lag
@@ -358,7 +512,7 @@ export default function App() {
     }
 
     return filtered;
-  }, [parseResult, timeWindow]);
+  }, [parseResult, timeWindow, zoomDurationSec, zoomPositionPct]);
 
   // Pre-calculate statistics for the current filtered data window
   const computedStats = useMemo(() => {
@@ -469,142 +623,265 @@ export default function App() {
   }, [parseResult]);
 
   // Algorithm to detect swim turn events across the entire session
+  // Uses stroke interval gaps as the primary turn signal.
+  // During swimming, strokes occur at regular intervals (0.7–2.5s).
+  // During a turn (glide → wall → push-off → glide), the gap between strokes
+  // is significantly longer (typically 3–8s). We detect turns by finding
+  // these abnormal gaps in the stroke rhythm, validated by a glide (low-activity) check.
   const detectedTurns = useMemo(() => {
     if (!parseResult || parseResult.readings.length === 0) return [];
 
     const readings = parseResult.readings;
+
+    // Build pause regions to exclude
+    const pauseRegions: { start: number; end: number }[] = [];
+    if (parseResult.rawEvents) {
+      for (let i = 0; i < parseResult.rawEvents.length; i++) {
+        if (parseResult.rawEvents[i].type === 'pause') {
+          const start = parseResult.rawEvents[i].timeOffsetMs;
+          const resume = parseResult.rawEvents.find((e, j) => j > i && e.type === 'resume');
+          const end = resume ? resume.timeOffsetMs : Infinity;
+          pauseRegions.push({ start, end });
+        }
+      }
+    }
+    function isDuringPause(timeMs: number) {
+      return pauseRegions.some(p => timeMs >= p.start && timeMs <= p.end);
+    }
+
+    // Re-run stroke detection to get stroke times
+    const fullData = readings;
+    const smoothedData: { reading: PebbleReading; smoothMag: number }[] = [];
+    const windowRadius = 4;
+    for (let i = 0; i < fullData.length; i++) {
+      let sum = 0, count = 0;
+      for (let j = Math.max(0, i - windowRadius); j <= Math.min(fullData.length - 1, i + windowRadius); j++) {
+        sum += fullData[j].magnitude; count++;
+      }
+      smoothedData.push({ reading: fullData[i], smoothMag: sum / count });
+    }
+    const smoothMags = smoothedData.map(s => s.smoothMag);
+    const avgMag = smoothMags.reduce((a, b) => a + b, 0) / smoothMags.length;
+    const maxMag = Math.max(...smoothMags);
+    const threshold = Math.max(1120, avgMag + (maxMag - avgMag) * 0.22);
+
+    const strokeTimes: number[] = [];
+    let lastStrokeTime = -Infinity;
+    for (let i = 1; i < smoothedData.length - 1; i++) {
+      const prev = smoothedData[i - 1].smoothMag;
+      const curr = smoothedData[i].smoothMag;
+      const next = smoothedData[i + 1].smoothMag;
+      if (curr > prev && curr > next && curr > threshold) {
+        const timeOffset = smoothedData[i].reading.timeOffset;
+        if (timeOffset - lastStrokeTime >= 700) {
+          strokeTimes.push(timeOffset);
+          lastStrokeTime = timeOffset;
+        }
+      }
+    }
+
+    if (strokeTimes.length < 4) return [];
+
+    // Precompute smoothed magnitude for glide validation
+    const sampleRateHz = parseResult.sampleRateHz || 10;
+    const glideWindowSamples = Math.round(sampleRateHz * 1.0);
+    const smoothedMagArr: number[] = [];
+    for (let i = 0; i < readings.length; i++) {
+      let sum = 0, count = 0;
+      const start = Math.max(0, i - glideWindowSamples);
+      const end = Math.min(readings.length - 1, i + glideWindowSamples);
+      for (let j = start; j <= end; j++) { sum += readings[j].magnitude; count++; }
+      smoothedMagArr.push(sum / count);
+    }
+    const overallAvgMag = smoothedMagArr.reduce((a, b) => a + b, 0) / smoothedMagArr.length;
+
+    function hasGlideInRange(startMs: number, endMs: number): boolean {
+      const sampleSpacing = 1000 / sampleRateHz;
+      const startIdx = Math.max(0, Math.floor(startMs / sampleSpacing));
+      const endIdx = Math.min(readings.length - 1, Math.ceil(endMs / sampleSpacing));
+      if (endIdx - startIdx < 3) return false;
+      let minMag = Infinity;
+      for (let i = startIdx; i <= endIdx; i++) {
+        if (smoothedMagArr[i] < minMag) minMag = smoothedMagArr[i];
+      }
+      return minMag < overallAvgMag * 0.88;
+    }
+
+    // Compute inter-stroke intervals (excluding pauses)
+    const intervals: { gapMs: number; afterStrokeIdx: number }[] = [];
+    for (let i = 1; i < strokeTimes.length; i++) {
+      const gapMs = strokeTimes[i] - strokeTimes[i - 1];
+      const midpoint = (strokeTimes[i] + strokeTimes[i - 1]) / 2;
+      if (!isDuringPause(midpoint)) {
+        intervals.push({ gapMs, afterStrokeIdx: i - 1 });
+      }
+    }
+
+    const MEDIAN_WINDOW = 4;
+    const MIN_TURN_GAP_RATIO = 1.3;
+    const MIN_TURN_GAP_ABS = 1800;
+    const MIN_TURN_INTERVAL = 22000;
+
+    // Score each interval
+    const scored = intervals.map((interval, i) => {
+      const nearbyIntervals: number[] = [];
+      for (let j = Math.max(0, i - MEDIAN_WINDOW); j <= Math.min(intervals.length - 1, i + MEDIAN_WINDOW); j++) {
+        if (j !== i) nearbyIntervals.push(intervals[j].gapMs);
+      }
+      if (nearbyIntervals.length < 2) return { ...interval, score: 0 };
+      const sorted = [...nearbyIntervals].sort((a, b) => a - b);
+      const p25Idx = Math.floor(sorted.length * 0.15);
+      const baseline = sorted[p25Idx];
+      const ratio = interval.gapMs / Math.max(baseline, 500);
+      return { ...interval, score: ratio };
+    });
+
+    // Select turns
     const turns: PebbleReading[] = [];
+    const turnTimes: number[] = [];
+    let lastTurnTimeMs = -Infinity;
 
-    if (parseResult.hasCompass) {
-      // --- Compass-based Turn Detection (Highly precise) ---
-      // We will compute rolling average direction before and after each point,
-      // and look for local maxima of angular difference near 180 degrees.
-      const diffs: { reading: PebbleReading; diff: number }[] = [];
-      let beforeStartIdx = 0;
-      let beforeEndIdx = 0;
-      let afterStartIdx = 0;
-      let afterEndIdx = 0;
+    for (const s of scored) {
+      if (s.gapMs < MIN_TURN_GAP_ABS) continue;
+      if (s.score < MIN_TURN_GAP_RATIO) continue;
 
-      for (let i = 0; i < readings.length; i++) {
-        const currTime = readings[i].timeOffset;
+      const gapStart = strokeTimes[s.afterStrokeIdx];
+      const gapEnd = strokeTimes[s.afterStrokeIdx + 1];
 
-        // Advance beforeStartIdx to first index >= currTime - 14000
-        while (beforeStartIdx < readings.length && readings[beforeStartIdx].timeOffset < currTime - 14000) {
-          beforeStartIdx++;
-        }
-        // Advance beforeEndIdx to first index > currTime - 3000
-        while (beforeEndIdx < readings.length && readings[beforeEndIdx].timeOffset <= currTime - 3000) {
-          beforeEndIdx++;
-        }
+      if (!hasGlideInRange(gapStart, gapEnd)) continue;
 
-        // Advance afterStartIdx to first index >= currTime + 3000
-        while (afterStartIdx < readings.length && readings[afterStartIdx].timeOffset < currTime + 3000) {
-          afterStartIdx++;
-        }
-        // Advance afterEndIdx to first index > currTime + 14000
-        while (afterEndIdx < readings.length && readings[afterEndIdx].timeOffset <= currTime + 14000) {
-          afterEndIdx++;
-        }
+      const turnTimeMs = (gapStart + gapEnd) / 2;
+      if (isDuringPause(turnTimeMs)) continue;
 
-        const beforeCount = beforeEndIdx - beforeStartIdx;
-        const afterCount = afterEndIdx - afterStartIdx;
+      if (turnTimeMs - lastTurnTimeMs >= MIN_TURN_INTERVAL) {
+        turnTimes.push(turnTimeMs);
+        lastTurnTimeMs = turnTimeMs;
+      }
+    }
 
-        if (beforeCount >= 8 && afterCount >= 8) {
-          // Circular average for before window
-          let sumCosB = 0;
-          let sumSinB = 0;
-          let countB = 0;
-          for (let k = beforeStartIdx; k < beforeEndIdx; k++) {
-            const comp = readings[k].compass;
-            if (comp !== undefined) {
-              const rad = (comp * Math.PI) / 180;
-              sumCosB += Math.cos(rad);
-              sumSinB += Math.sin(rad);
-              countB++;
-            }
-          }
+    // Post-filter: remove turns that create laps shorter than 20s
+    const MIN_LAP_DURATION = 20000;
+    const filteredTimes: number[] = [];
+    for (let i = 0; i < turnTimes.length; i++) {
+      const prevTime = filteredTimes.length > 0 ? filteredTimes[filteredTimes.length - 1] : 0;
+      const nextTime = i < turnTimes.length - 1 ? turnTimes[i + 1] : readings[readings.length - 1].timeOffset;
+      const lapBefore = turnTimes[i] - prevTime;
+      const lapAfter = nextTime - turnTimes[i];
+      if (lapBefore >= MIN_LAP_DURATION && lapAfter >= MIN_LAP_DURATION) {
+        filteredTimes.push(turnTimes[i]);
+      }
+    }
 
-          // Circular average for after window
-          let sumCosA = 0;
-          let sumSinA = 0;
-          let countA = 0;
-          for (let k = afterStartIdx; k < afterEndIdx; k++) {
-            const comp = readings[k].compass;
-            if (comp !== undefined) {
-              const rad = (comp * Math.PI) / 180;
-              sumCosA += Math.cos(rad);
-              sumSinA += Math.sin(rad);
-              countA++;
-            }
-          }
+    // SECONDARY: Y-variance + Z-variance detector for breaststroke turns.
+    // Breaststroke turns show a burst of high-frequency Y oscillations and 
+    // increased Z amplitude. We detect this as a spike in combined Y+Z standard
+    // deviation in short (1.5s) windows compared to local baseline.
+    // Additionally, we detect Z-range spikes (hand diving below surface during turn).
+    const SEC_WINDOW = Math.round(sampleRateHz * 1.5); // 1.5s analysis window
+    const SEC_STEP = Math.round(sampleRateHz * 0.5); // 0.5s step
+    const SEC_COMBINED_RATIO = 1.55; // Combined Y+Z std must be 1.55× local baseline
+    const SEC_ZRANGE_RATIO = 1.4; // Z range must be 1.4× local baseline
+    const SEC_MIN_INTERVAL = 22000;
 
-          if (countB > 0 && countA > 0) {
-            const avgRadB = Math.atan2(sumSinB / countB, sumCosB / countB);
-            let avgDegB = (avgRadB * 180) / Math.PI;
-            if (avgDegB < 0) avgDegB += 360;
+    const secMetrics: { timeMs: number; combined: number; zRange: number; magMin: number }[] = [];
+    for (let i = SEC_WINDOW; i < readings.length - SEC_WINDOW; i += SEC_STEP) {
+      const ws = i - Math.floor(SEC_WINDOW / 2);
+      const we = i + Math.floor(SEC_WINDOW / 2);
 
-            const avgRadA = Math.atan2(sumSinA / countA, sumCosA / countA);
-            let avgDegA = (avgRadA * 180) / Math.PI;
-            if (avgDegA < 0) avgDegA += 360;
+      // Y std dev
+      let ySum = 0;
+      for (let j = ws; j < we; j++) ySum += readings[j].y;
+      const yMean = ySum / (we - ws);
+      let yVar = 0;
+      for (let j = ws; j < we; j++) yVar += (readings[j].y - yMean) ** 2;
+      const yStd = Math.sqrt(yVar / (we - ws));
 
-            const angularDiff = 180 - Math.abs(180 - Math.abs(avgDegB - avgDegA));
-            diffs.push({ reading: readings[i], diff: angularDiff });
-          }
+      // Z std dev and range
+      let zSum = 0, zMin = Infinity, zMax = -Infinity;
+      for (let j = ws; j < we; j++) {
+        zSum += readings[j].z;
+        if (readings[j].z < zMin) zMin = readings[j].z;
+        if (readings[j].z > zMax) zMax = readings[j].z;
+      }
+      const zMean = zSum / (we - ws);
+      let zVar = 0;
+      for (let j = ws; j < we; j++) zVar += (readings[j].z - zMean) ** 2;
+      const zStd = Math.sqrt(zVar / (we - ws));
+
+      // Mag min in window
+      let magMin = Infinity;
+      for (let j = ws; j < we; j++) { if (readings[j].magnitude < magMin) magMin = readings[j].magnitude; }
+
+      secMetrics.push({ timeMs: readings[i].timeOffset, combined: yStd + zStd, zRange: zMax - zMin, magMin });
+    }
+
+    // Find peaks that exceed local baseline
+    const SEC_NEIGHBORHOOD = 16;
+    let lastSecTurn = -Infinity;
+
+    for (let i = SEC_NEIGHBORHOOD; i < secMetrics.length - SEC_NEIGHBORHOOD; i++) {
+      const curr = secMetrics[i];
+      const timeMs = curr.timeMs;
+
+      if (isDuringPause(timeMs)) continue;
+      if (filteredTimes.some(t => Math.abs(t - timeMs) < SEC_MIN_INTERVAL)) continue;
+      if (timeMs - lastSecTurn < SEC_MIN_INTERVAL) continue;
+      if (timeMs < 20000 || timeMs > readings[readings.length - 1].timeOffset - 10000) continue;
+
+      // Must be a local maximum in combined OR zRange
+      const isLocalMaxCombined = (i === 0 || secMetrics[i-1].combined < curr.combined) && 
+                                  (i === secMetrics.length-1 || secMetrics[i+1].combined < curr.combined);
+      const isLocalMaxZRange = (i === 0 || secMetrics[i-1].zRange < curr.zRange) && 
+                                (i === secMetrics.length-1 || secMetrics[i+1].zRange < curr.zRange);
+      
+      if (!isLocalMaxCombined && !isLocalMaxZRange) continue;
+
+      // Compute local baseline (excluding ±4 windows around current point)
+      let baseCombined = 0, baseZRange = 0, baseCount = 0;
+      for (let j = i - SEC_NEIGHBORHOOD; j <= i + SEC_NEIGHBORHOOD; j++) {
+        if (j >= 0 && j < secMetrics.length && Math.abs(j - i) > 4) {
+          baseCombined += secMetrics[j].combined;
+          baseZRange += secMetrics[j].zRange;
+          baseCount++;
         }
       }
+      if (baseCount === 0) continue;
+      const avgCombined = baseCombined / baseCount;
+      const avgZRange = baseZRange / baseCount;
 
-      // Find local maxima in diffs
-      let lastTurnTime = -Infinity;
-      const minTurnInterval = 35000; // Minimum 35s between turns (covers standard pool lap times)
+      // Detection criteria: EITHER high combined Y+Z std OR high Z range with low magMin
+      const combinedPass = curr.combined > avgCombined * SEC_COMBINED_RATIO;
+      const zRangePass = curr.zRange > avgZRange * SEC_ZRANGE_RATIO && curr.magMin < overallAvgMag * 0.85;
 
-      for (let j = 1; j < diffs.length - 1; j++) {
-        const prev = diffs[j - 1].diff;
-        const curr = diffs[j].diff;
-        const next = diffs[j + 1].diff;
-
-        if (curr > prev && curr > next && curr > 135) {
-          const time = diffs[j].reading.timeOffset;
-          if (time - lastTurnTime >= minTurnInterval) {
-            turns.push(diffs[j].reading);
-            lastTurnTime = time;
-          }
-        }
+      if (combinedPass || zRangePass) {
+        filteredTimes.push(timeMs);
+        lastSecTurn = timeMs;
       }
-    } else {
-      // --- Fallback: Accelerometer-based Turn Detection ---
-      // We look for quiet streamline glide periods with very low standard deviation in magnitude
-      const stdDevs: { reading: PebbleReading; stdDev: number }[] = [];
-      const halfWin = 15; // 3 seconds window around point (at 10Hz)
+    }
 
-      for (let i = halfWin; i < readings.length - halfWin; i++) {
-        const windowReadings = readings.slice(i - halfWin, i + halfWin);
-        if (windowReadings.length > 0) {
-          const mags = windowReadings.map(r => r.magnitude);
-          const mean = mags.reduce((a, b) => a + b, 0) / mags.length;
-          const variance = mags.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / mags.length;
-          const stdDev = Math.sqrt(variance);
-          stdDevs.push({ reading: readings[i], stdDev });
-        }
+    // Re-sort and re-apply lap duration filter
+    filteredTimes.sort((a, b) => a - b);
+    const finalTimes: number[] = [];
+    for (let i = 0; i < filteredTimes.length; i++) {
+      const prevTime = finalTimes.length > 0 ? finalTimes[finalTimes.length - 1] : 0;
+      const nextTime = i < filteredTimes.length - 1 ? filteredTimes[i + 1] : readings[readings.length - 1].timeOffset;
+      const lapBefore = filteredTimes[i] - prevTime;
+      const lapAfter = nextTime - filteredTimes[i];
+      if (lapBefore >= MIN_LAP_DURATION && lapAfter >= MIN_LAP_DURATION) {
+        finalTimes.push(filteredTimes[i]);
       }
+    }
 
-      let lastTurnTime = -Infinity;
-      const minTurnInterval = 35000;
-
-      for (let j = 1; j < stdDevs.length - 1; j++) {
-        const prev = stdDevs[j - 1].stdDev;
-        const curr = stdDevs[j].stdDev;
-        const next = stdDevs[j + 1].stdDev;
-
-        if (curr < prev && curr < next && curr < 115) {
-          const time = stdDevs[j].reading.timeOffset;
-          if (time > 15000 && time < readings[readings.length - 1].timeOffset - 15000) {
-            if (time - lastTurnTime >= minTurnInterval) {
-              turns.push(stdDevs[j].reading);
-              lastTurnTime = time;
-            }
-          }
-        }
+    // Map turn times to nearest readings
+    for (const turnTimeMs of finalTimes) {
+      let closest = readings[0];
+      let minDiff = Math.abs(readings[0].timeOffset - turnTimeMs);
+      for (let k = 1; k < readings.length; k++) {
+        const diff = Math.abs(readings[k].timeOffset - turnTimeMs);
+        if (diff < minDiff) { minDiff = diff; closest = readings[k]; }
+        else if (readings[k].timeOffset > turnTimeMs + 1000) break;
       }
+      turns.push(closest);
     }
 
     return turns;
@@ -671,6 +948,330 @@ export default function App() {
 
     return markers;
   }, [detectedTurns, graphData]);
+
+  // Compute pause/resume markers mapped to the visible graph time range
+  const pauseResumeMarkers = useMemo(() => {
+    if (!parseResult || parseResult.rawEvents.length === 0 || graphData.length === 0) return [];
+
+    const minTime = graphData[0].timeOffset;
+    const maxTime = graphData[graphData.length - 1].timeOffset;
+
+    // Build pairs of pause ranges. Each pause has a start timeStr and end timeStr for the ReferenceArea.
+    const markers: { type: string; timeOffsetMs: number; timeStr: string }[] = [];
+
+    for (const evt of parseResult.rawEvents) {
+      if (evt.timeOffsetMs >= minTime && evt.timeOffsetMs <= maxTime) {
+        // Find the closest graphData point to get its timeStr
+        let closest = graphData[0];
+        let minDiff = Math.abs(graphData[0].timeOffset - evt.timeOffsetMs);
+        for (let i = 1; i < graphData.length; i++) {
+          const diff = Math.abs(graphData[i].timeOffset - evt.timeOffsetMs);
+          if (diff < minDiff) {
+            minDiff = diff;
+            closest = graphData[i];
+          }
+        }
+        markers.push({
+          type: evt.type,
+          timeOffsetMs: evt.timeOffsetMs,
+          timeStr: closest.timeStr
+        });
+      }
+    }
+
+    // Build pause regions (from pause to resume, or pause to end of data)
+    const regions: { x1: string; x2: string }[] = [];
+    for (let i = 0; i < markers.length; i++) {
+      if (markers[i].type === 'pause') {
+        const resumeMarker = markers.find((m, j) => j > i && m.type === 'resume');
+        if (resumeMarker) {
+          regions.push({ x1: markers[i].timeStr, x2: resumeMarker.timeStr });
+        } else {
+          // Pause extends to end of visible data
+          regions.push({ x1: markers[i].timeStr, x2: graphData[graphData.length - 1].timeStr });
+        }
+      }
+    }
+
+    return regions;
+  }, [parseResult, graphData]);
+
+  // Annotation turn markers mapped to graph timeStr values
+  const annotationMarkers = useMemo(() => {
+    if (annotations.turns.length === 0 || graphData.length === 0) return [];
+
+    const minTime = graphData[0].timeOffset;
+    const maxTime = graphData[graphData.length - 1].timeOffset;
+
+    return annotations.turns
+      .filter(t => t >= minTime && t <= maxTime)
+      .map(turnTimeMs => {
+        let closest = graphData[0];
+        let minDiff = Math.abs(graphData[0].timeOffset - turnTimeMs);
+        for (let i = 1; i < graphData.length; i++) {
+          const diff = Math.abs(graphData[i].timeOffset - turnTimeMs);
+          if (diff < minDiff) { minDiff = diff; closest = graphData[i]; }
+        }
+        return { timeOffsetMs: turnTimeMs, timeStr: closest.timeStr };
+      });
+  }, [annotations, graphData]);
+
+  // Compute which annotations are matched by the algorithm (within ±4s)
+  const matchedAnnotations = useMemo(() => {
+    const MATCH_THRESHOLD = 4000; // ±4 seconds
+    return annotations.turns.map(annoTime => {
+      return detectedTurns.some(turn => Math.abs(turn.timeOffset - annoTime) < MATCH_THRESHOLD);
+    });
+  }, [annotations, detectedTurns]);
+
+  // Handle chart click in annotate mode: select annotation for editing, or place new one
+  const handleChartClick = () => {
+    if (!annotateMode || !selectedFile || !parseResult) return;
+    const reading = hoverReadingRef.current;
+    if (!reading) return;
+
+    const clickedTime = reading.timeOffset;
+
+    // Check if clicking near an existing annotation — if so, select it for editing
+    const SNAP_THRESHOLD = 3000; // 3 seconds snap radius
+    const nearIdx = annotations.turns.findIndex(t => Math.abs(t - clickedTime) < SNAP_THRESHOLD);
+
+    if (nearIdx !== -1) {
+      // Select for editing (pause if playing)
+      setIsPlaying(false);
+      setEditingAnnotationIdx(nearIdx);
+      // Move playhead to the annotation
+      playheadRef.current = annotations.turns[nearIdx];
+      setPlayheadMs(annotations.turns[nearIdx]);
+    } else if (editingAnnotationIdx === null) {
+      // Not in edit mode and not near existing — add new annotation
+      const newTurns = [...annotations.turns, clickedTime].sort((a, b) => a - b);
+      const newAnnotations: AnnotationData = { turns: newTurns };
+      setAnnotations(newAnnotations);
+      const newIdx = newTurns.indexOf(clickedTime);
+      setEditingAnnotationIdx(newIdx);
+      setIsPlaying(false);
+
+      if (dataSource === 'local' && selectedFile) {
+        saveAnnotations(selectedFile.id, newAnnotations).catch(err =>
+          console.error('Failed to save annotations:', err)
+        );
+      }
+    } else {
+      // In edit mode, clicking elsewhere closes edit mode
+      closeEditMode();
+    }
+  };
+
+  // --- Playback animation loop ---
+  // When playing, advance the playhead and update the zoom position at a throttled rate
+  // so the waveform pans smoothly without overwhelming Recharts rendering
+  useEffect(() => {
+    if (!isPlaying || !parseResult) return;
+
+    const totalMs = parseResult.totalDurationMs;
+    const windowMs = zoomDurationSec * 1000;
+    const PAN_INTERVAL = 150; // Update chart pan every 150ms for smooth waveform movement
+
+    lastFrameTimeRef.current = performance.now();
+    let lastPanTime = performance.now();
+
+    const animate = (now: number) => {
+      const dt = now - lastFrameTimeRef.current;
+      lastFrameTimeRef.current = now;
+
+      // Advance playhead by dt * speed
+      const advance = dt * playbackSpeed;
+      let newPlayhead = playheadRef.current + advance;
+
+      if (newPlayhead >= totalMs) {
+        newPlayhead = totalMs;
+        setIsPlaying(false);
+      }
+
+      playheadRef.current = newPlayhead;
+      setPlayheadMs(newPlayhead);
+
+      // Update zoom position (pans the waveform) at throttled rate
+      if (now - lastPanTime >= PAN_INTERVAL) {
+        lastPanTime = now;
+        const maxStartMs = Math.max(0, totalMs - windowMs);
+        if (maxStartMs > 0) {
+          const targetStart = newPlayhead - windowMs / 2;
+          const clampedStart = Math.max(0, Math.min(maxStartMs, targetStart));
+          const pct = (clampedStart / maxStartMs) * 100;
+          setZoomPositionPct(pct);
+        }
+      }
+
+      if (newPlayhead < totalMs) {
+        animFrameRef.current = requestAnimationFrame(animate);
+      }
+    };
+
+    animFrameRef.current = requestAnimationFrame(animate);
+
+    return () => {
+      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+    };
+  }, [isPlaying, playbackSpeed, parseResult, zoomDurationSec]);
+
+  // Toggle play/pause
+  const togglePlayback = () => {
+    if (!parseResult) return;
+    if (isPlaying) {
+      setIsPlaying(false);
+    } else {
+      // If at end, restart from beginning
+      if (playheadRef.current >= parseResult.totalDurationMs) {
+        playheadRef.current = 0;
+        setPlayheadMs(0);
+        setZoomPositionPct(0);
+      }
+      setIsPlaying(true);
+    }
+  };
+
+  // Mark turn at playhead position — pauses playback and enters edit mode
+  const markTurnAtPlayhead = () => {
+    if (!selectedFile || !parseResult) return;
+    setIsPlaying(false); // Auto-pause
+
+    const currentTime = playheadRef.current;
+
+    // Check if near existing (select it for editing) or add new
+    const SNAP_THRESHOLD = 2000;
+    const nearIdx = annotations.turns.findIndex(t => Math.abs(t - currentTime) < SNAP_THRESHOLD);
+
+    if (nearIdx !== -1) {
+      // Select existing for editing
+      setEditingAnnotationIdx(nearIdx);
+    } else {
+      // Add new and enter edit mode for it
+      const newTurns = [...annotations.turns, currentTime].sort((a, b) => a - b);
+      const newAnnotations: AnnotationData = { turns: newTurns };
+      setAnnotations(newAnnotations);
+      // Find the index of the newly added one
+      const newIdx = newTurns.indexOf(currentTime);
+      setEditingAnnotationIdx(newIdx);
+
+      if (dataSource === 'local' && selectedFile) {
+        saveAnnotations(selectedFile.id, newAnnotations).catch(err =>
+          console.error('Failed to save annotations:', err)
+        );
+      }
+    }
+  };
+
+  // Move the currently edited annotation left or right by 1 second
+  const nudgeAnnotation = (direction: 'left' | 'right') => {
+    if (editingAnnotationIdx === null) return;
+    const shift = direction === 'left' ? -1000 : 1000;
+    const newTurns = [...annotations.turns];
+    newTurns[editingAnnotationIdx] = Math.max(0, newTurns[editingAnnotationIdx] + shift);
+    newTurns.sort((a, b) => a - b);
+    // Find where the edited one ended up after sort
+    const movedTime = Math.max(0, annotations.turns[editingAnnotationIdx] + shift);
+    const newIdx = newTurns.indexOf(movedTime);
+
+    const newAnnotations: AnnotationData = { turns: newTurns };
+    setAnnotations(newAnnotations);
+    setEditingAnnotationIdx(newIdx);
+
+    // Update playhead to follow the annotation
+    playheadRef.current = movedTime;
+    setPlayheadMs(movedTime);
+
+    // Center zoom on it
+    if (parseResult) {
+      const totalMs = parseResult.totalDurationMs;
+      const windowMs = zoomDurationSec * 1000;
+      const maxStartMs = Math.max(0, totalMs - windowMs);
+      if (maxStartMs > 0) {
+        const targetStart = movedTime - windowMs / 2;
+        const clampedStart = Math.max(0, Math.min(maxStartMs, targetStart));
+        setZoomPositionPct((clampedStart / maxStartMs) * 100);
+      }
+    }
+
+    if (dataSource === 'local' && selectedFile) {
+      saveAnnotations(selectedFile.id, newAnnotations).catch(err =>
+        console.error('Failed to save annotations:', err)
+      );
+    }
+  };
+
+  // Delete the currently edited annotation
+  const deleteAnnotation = () => {
+    if (editingAnnotationIdx === null) return;
+    const newTurns = annotations.turns.filter((_, i) => i !== editingAnnotationIdx);
+    const newAnnotations: AnnotationData = { turns: newTurns };
+    setAnnotations(newAnnotations);
+    setEditingAnnotationIdx(null);
+
+    if (dataSource === 'local' && selectedFile) {
+      saveAnnotations(selectedFile.id, newAnnotations).catch(err =>
+        console.error('Failed to save annotations:', err)
+      );
+    }
+  };
+
+  // Close edit mode
+  const closeEditMode = () => {
+    setEditingAnnotationIdx(null);
+  };
+
+  // Keyboard shortcuts: Space = play/pause, T = mark turn, Arrows = nudge, Delete = remove, Escape = close edit
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      // Don't capture if typing in an input
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if (!annotateMode) return;
+
+      if (e.code === 'Space') {
+        e.preventDefault();
+        if (editingAnnotationIdx !== null) {
+          closeEditMode();
+        } else {
+          togglePlayback();
+        }
+      } else if (e.code === 'KeyT') {
+        e.preventDefault();
+        markTurnAtPlayhead();
+      } else if (e.code === 'ArrowLeft' && editingAnnotationIdx !== null) {
+        e.preventDefault();
+        nudgeAnnotation('left');
+      } else if (e.code === 'ArrowRight' && editingAnnotationIdx !== null) {
+        e.preventDefault();
+        nudgeAnnotation('right');
+      } else if ((e.code === 'Delete' || e.code === 'Backspace') && editingAnnotationIdx !== null) {
+        e.preventDefault();
+        deleteAnnotation();
+      } else if (e.code === 'Escape') {
+        e.preventDefault();
+        closeEditMode();
+      }
+    };
+
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [annotateMode, annotations, selectedFile, parseResult, dataSource, isPlaying, editingAnnotationIdx]);
+
+  // Compute playhead marker position in graphData for rendering
+  const playheadMarker = useMemo(() => {
+    if (!annotateMode || graphData.length === 0) return null;
+    const minTime = graphData[0].timeOffset;
+    const maxTime = graphData[graphData.length - 1].timeOffset;
+    if (playheadMs < minTime || playheadMs > maxTime) return null;
+
+    let closest = graphData[0];
+    let minDiff = Math.abs(graphData[0].timeOffset - playheadMs);
+    for (let i = 1; i < graphData.length; i++) {
+      const diff = Math.abs(graphData[i].timeOffset - playheadMs);
+      if (diff < minDiff) { minDiff = diff; closest = graphData[i]; }
+    }
+    return closest.timeStr;
+  }, [annotateMode, playheadMs, graphData]);
 
   // Classify strokes for each lap based on the C classifier logic
   const lapStrokeTypes = useMemo(() => {
@@ -789,6 +1390,33 @@ export default function App() {
         </div>
 
         <div className="flex items-center space-x-6">
+          {/* Data Source Toggle */}
+          <div className="flex items-center gap-1 bg-slate-950/80 rounded-full border border-slate-800 p-0.5">
+            <button
+              onClick={() => handleSwitchSource('local')}
+              className={`px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wide transition-all ${
+                dataSource === 'local'
+                  ? 'bg-blue-600 text-white'
+                  : 'text-slate-400 hover:text-slate-200'
+              } ${!localAvailable && dataSource !== 'local' ? 'opacity-50 cursor-not-allowed' : ''}`}
+              disabled={!localAvailable && dataSource !== 'local'}
+              title={localAvailable ? 'Use local files' : 'Local server not detected'}
+            >
+              Local
+            </button>
+            <button
+              onClick={() => handleSwitchSource('drive')}
+              className={`px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wide transition-all ${
+                dataSource === 'drive'
+                  ? 'bg-blue-600 text-white'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+              title="Use Google Drive"
+            >
+              Drive
+            </button>
+          </div>
+
           {parseResult && (
             <>
               <div className="text-right hidden sm:block">
@@ -835,7 +1463,7 @@ export default function App() {
             <div className="h-8 w-8 border-4 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
             <p className="text-slate-400 text-xs font-mono">Initializing connection profile...</p>
           </div>
-        ) : needsAuth ? (
+        ) : needsAuth && dataSource === 'drive' ? (
           /* Authentication Screen */
           <motion.div 
             initial={{ opacity: 0, y: 15 }}
@@ -998,7 +1626,7 @@ export default function App() {
                           )}
 
                           <div className="space-y-0.5 min-w-0 flex-1">
-                            <div className="font-medium text-slate-200 truncate pr-2 font-mono text-[10px]" title={file.name}>
+                            <div className={`font-medium truncate pr-2 font-mono text-[10px] ${annotatedFiles.has(file.id) ? 'text-cyan-300' : 'text-slate-200'}`} title={file.name}>
                               {file.name}
                             </div>
                             <div className="flex items-center gap-2 text-[9px] text-slate-500 font-mono">
@@ -1103,32 +1731,6 @@ export default function App() {
                           <h2 className="text-sm font-bold text-slate-100 truncate font-mono" title={selectedFile?.name}>
                             {selectedFile?.name}
                           </h2>
-                        </div>
-
-                        {/* Chart range Toggle (First Minute vs Full) */}
-                        <div className="flex bg-slate-950 p-1 border border-slate-800 rounded self-start md:self-auto">
-                          <button
-                            id="btn_view_first_minute"
-                            onClick={() => setTimeWindow('first-minute')}
-                            className={`px-3 py-1 rounded text-[10px] font-bold uppercase tracking-wider transition-all flex items-center gap-1.5 ${
-                              timeWindow === 'first-minute'
-                                ? 'bg-blue-600 text-white shadow-md'
-                                : 'text-slate-400 hover:text-slate-200'
-                            }`}
-                          >
-                            <Clock className="h-3 w-3" /> First Minute
-                          </button>
-                          <button
-                            id="btn_view_full"
-                            onClick={() => setTimeWindow('full')}
-                            className={`px-3 py-1 rounded text-[10px] font-bold uppercase tracking-wider transition-all flex items-center gap-1.5 ${
-                              timeWindow === 'full'
-                                ? 'bg-blue-600 text-white shadow-md'
-                                : 'text-slate-400 hover:text-slate-200'
-                            }`}
-                          >
-                            <Sliders className="h-3 w-3" /> Full Session ({totalDurationString})
-                          </button>
                         </div>
                       </div>
 
@@ -1275,13 +1877,268 @@ export default function App() {
                           </div>
                         )}
 
-                        {/* Core Plot Grid */}
-                        <div className="grid grid-cols-1 xl:grid-cols-12 gap-4">
-                          
-                          {/* Stacked Telemetry Column (Takes 8 cols) */}
-                          <div className="xl:col-span-8 flex flex-col gap-4">
+                        {/* Zoom Control Widget */}
+                        <div className="bg-slate-900/50 border border-slate-800 p-4 rounded-lg flex flex-col gap-3">
+                          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                            <div className="flex items-center gap-2">
+                              <div className="flex bg-slate-950 p-1 border border-slate-800 rounded">
+                                <button
+                                  id="btn_view_first_minute"
+                                  onClick={() => setTimeWindow('first-minute')}
+                                  className={`px-3 py-1 rounded text-[10px] font-bold uppercase tracking-wider transition-all flex items-center gap-1.5 ${
+                                    timeWindow === 'first-minute'
+                                      ? 'bg-blue-600 text-white shadow-md'
+                                      : 'text-slate-400 hover:text-slate-200'
+                                  }`}
+                                >
+                                  <Clock className="h-3 w-3" /> First Minute
+                                </button>
+                                <button
+                                  id="btn_view_full"
+                                  onClick={() => setTimeWindow('full')}
+                                  className={`px-3 py-1 rounded text-[10px] font-bold uppercase tracking-wider transition-all flex items-center gap-1.5 ${
+                                    timeWindow === 'full'
+                                      ? 'bg-blue-600 text-white shadow-md'
+                                      : 'text-slate-400 hover:text-slate-200'
+                                  }`}
+                                >
+                                  <Sliders className="h-3 w-3" /> Full Session ({totalDurationString})
+                                </button>
+                              </div>
+
+                              {/* Annotate Mode Toggle */}
+                              {dataSource === 'local' && (
+                                <button
+                                  onClick={() => {
+                                    const newMode = !annotateMode;
+                                    setAnnotateMode(newMode);
+                                    if (newMode) {
+                                      setTimeWindow('full');
+                                      // Set playhead to current zoom start
+                                      if (parseResult) {
+                                        const totalMs = parseResult.totalDurationMs;
+                                        const windowMs = zoomDurationSec * 1000;
+                                        const maxStartMs = Math.max(0, totalMs - windowMs);
+                                        const startMs = (zoomPositionPct / 100) * maxStartMs;
+                                        playheadRef.current = startMs;
+                                        setPlayheadMs(startMs);
+                                      }
+                                    } else {
+                                      setIsPlaying(false);
+                                    }
+                                  }}
+                                  className={`px-3 py-1.5 rounded text-[10px] font-bold uppercase tracking-wider transition-all flex items-center gap-1.5 border ${
+                                    annotateMode
+                                      ? 'bg-emerald-600 border-emerald-500 text-white shadow-md shadow-emerald-900/30'
+                                      : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200 hover:border-slate-700'
+                                  }`}
+                                >
+                                  <ChevronRight className={`h-3 w-3 transition-transform ${annotateMode ? 'rotate-90' : ''}`} />
+                                  {annotateMode ? 'Annotating' : 'Annotate'}
+                                  {annotations.turns.length > 0 && (
+                                    <span className="ml-1 px-1 py-0.5 bg-emerald-900/50 rounded text-[8px] font-mono">
+                                      {annotations.turns.length}
+                                    </span>
+                                  )}
+                                </button>
+                              )}
+                            </div>
+                          </div>
+
+                          {/* Playback Controls (visible in annotate mode) */}
+                          {annotateMode && parseResult && (
+                            <div className="bg-slate-950 p-3 rounded border border-emerald-800/40 flex flex-col gap-2">
+                              {/* Edit mode panel */}
+                              {editingAnnotationIdx !== null ? (
+                                <div className="flex flex-wrap items-center gap-3">
+                                  <span className="text-[10px] font-bold text-blue-400 uppercase tracking-wider font-mono">
+                                    Editing A{editingAnnotationIdx + 1} — {formatTimeOffset(annotations.turns[editingAnnotationIdx] || 0)}
+                                  </span>
+
+                                  {/* Nudge left */}
+                                  <button
+                                    onClick={() => nudgeAnnotation('left')}
+                                    className="px-2 py-1 rounded text-[10px] font-bold transition-all flex items-center gap-1 border bg-slate-900 border-slate-700 text-slate-200 hover:bg-slate-800"
+                                  >
+                                    ← −1s
+                                  </button>
+
+                                  {/* Nudge right */}
+                                  <button
+                                    onClick={() => nudgeAnnotation('right')}
+                                    className="px-2 py-1 rounded text-[10px] font-bold transition-all flex items-center gap-1 border bg-slate-900 border-slate-700 text-slate-200 hover:bg-slate-800"
+                                  >
+                                    +1s →
+                                  </button>
+
+                                  {/* Delete */}
+                                  <button
+                                    onClick={deleteAnnotation}
+                                    className="px-2 py-1 rounded text-[10px] font-bold transition-all flex items-center gap-1 border bg-red-900/50 border-red-700 text-red-300 hover:bg-red-800/50"
+                                  >
+                                    🗑 Delete
+                                  </button>
+
+                                  {/* Done */}
+                                  <button
+                                    onClick={closeEditMode}
+                                    className="px-2 py-1 rounded text-[10px] font-bold transition-all flex items-center gap-1 border bg-emerald-900/50 border-emerald-700 text-emerald-300 hover:bg-emerald-800/50 ml-auto"
+                                  >
+                                    ✓ Done
+                                  </button>
+                                </div>
+                              ) : (
+                                <div className="flex flex-wrap items-center gap-3">
+                                  {/* Play/Pause */}
+                                  <button
+                                    onClick={togglePlayback}
+                                    className={`px-3 py-1.5 rounded text-[10px] font-bold uppercase tracking-wider transition-all flex items-center gap-1.5 border ${
+                                      isPlaying
+                                        ? 'bg-amber-600 border-amber-500 text-white'
+                                        : 'bg-emerald-600 border-emerald-500 text-white'
+                                    }`}
+                                  >
+                                    {isPlaying ? '⏸ Pause' : '▶ Play'}
+                                  </button>
+
+                                  {/* Mark Turn button */}
+                                  <button
+                                    onClick={markTurnAtPlayhead}
+                                    className="px-3 py-1.5 rounded text-[10px] font-bold uppercase tracking-wider transition-all flex items-center gap-1.5 border bg-blue-600 border-blue-500 text-white hover:bg-blue-500"
+                                  >
+                                    📍 Mark Turn (T)
+                                  </button>
+
+                                  {/* Speed selector */}
+                                  <div className="flex items-center gap-1.5">
+                                    <span className="text-[9px] text-slate-500 font-mono uppercase">Speed:</span>
+                                    {[1, 2, 5, 10, 20].map(s => (
+                                      <button
+                                        key={s}
+                                        onClick={() => setPlaybackSpeed(s)}
+                                        className={`px-1.5 py-0.5 rounded text-[9px] font-bold font-mono border transition-all ${
+                                          playbackSpeed === s
+                                            ? 'bg-blue-600 border-blue-500 text-white'
+                                            : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-white'
+                                        }`}
+                                      >
+                                        {s}×
+                                      </button>
+                                    ))}
+                                  </div>
+
+                                  {/* Playhead time */}
+                                  <span className="text-[10px] font-mono text-slate-300 ml-auto">
+                                    {formatTimeOffset(playheadMs)} / {formatTimeOffset(parseResult.totalDurationMs)}
+                                  </span>
+                                </div>
+                              )}
+
+                              {/* Shortcuts hint */}
+                              <div className="text-[9px] text-slate-500 font-mono">
+                                {editingAnnotationIdx !== null
+                                  ? <>Shortcuts: <kbd className="px-1 py-0.5 bg-slate-800 rounded text-slate-300">←</kbd><kbd className="px-1 py-0.5 bg-slate-800 rounded text-slate-300">→</kbd> nudge ±1s · <kbd className="px-1 py-0.5 bg-slate-800 rounded text-slate-300">Del</kbd> delete · <kbd className="px-1 py-0.5 bg-slate-800 rounded text-slate-300">Esc</kbd>/<kbd className="px-1 py-0.5 bg-slate-800 rounded text-slate-300">Space</kbd> done</>
+                                  : <>Shortcuts: <kbd className="px-1 py-0.5 bg-slate-800 rounded text-slate-300">Space</kbd> play/pause · <kbd className="px-1 py-0.5 bg-slate-800 rounded text-slate-300">T</kbd> mark turn · Click blue line to edit</>
+                                }
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Zoom Sliders and Quick Buttons (visible in full mode) */}
+                          {timeWindow === 'full' && parseResult && (
+                            <div className="bg-slate-950 p-3 rounded border border-slate-800/80 flex flex-col gap-2.5">
+                              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                                <div className="flex items-center gap-1.5">
+                                  <Sliders className="h-3.5 w-3.5 text-blue-400" />
+                                  <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider font-mono">Zoom Control Widget</span>
+                                </div>
+                                <div className="flex items-center gap-2 font-mono text-[10px]">
+                                  <span className="text-slate-500">Active Window Size:</span>
+                                  <span className="font-bold text-blue-400 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-800">
+                                    {zoomDurationSec >= Math.round(parseResult.totalDurationMs / 1000) ? 'Full Session' : `${zoomDurationSec}s`}
+                                  </span>
+                                </div>
+                              </div>
+
+                              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-center">
+                                {/* Slider 1: Zoom Level (Window Duration) */}
+                                <div className="flex flex-col gap-1">
+                                  <div className="flex justify-between items-center text-[9px] text-slate-500 font-mono">
+                                    <span>5s (Zoom In)</span>
+                                    <span className="text-slate-400 font-medium">Window Duration</span>
+                                    <span>Full (Zoom Out)</span>
+                                  </div>
+                                  <input
+                                    type="range"
+                                    min={5}
+                                    max={Math.max(5, Math.round(parseResult.totalDurationMs / 1000))}
+                                    value={zoomDurationSec}
+                                    onChange={(e) => {
+                                      const val = parseInt(e.target.value);
+                                      setZoomDurationSec(val);
+                                    }}
+                                    className="w-full h-1 bg-slate-800 rounded appearance-none cursor-pointer accent-blue-500 focus:outline-none"
+                                  />
+                                </div>
+
+                                {/* Slider 2: Pan/Position */}
+                                <div className="flex flex-col gap-1">
+                                  <div className="flex justify-between items-center text-[9px] text-slate-500 font-mono">
+                                    <span>Start (0%)</span>
+                                    <span className="text-slate-400 font-medium">Timeline Position</span>
+                                    <span>End (100%)</span>
+                                  </div>
+                                  <input
+                                    type="range"
+                                    min={0}
+                                    max={100}
+                                    value={zoomPositionPct}
+                                    disabled={zoomDurationSec >= Math.round(parseResult.totalDurationMs / 1000)}
+                                    onChange={(e) => {
+                                      setZoomPositionPct(parseFloat(e.target.value));
+                                    }}
+                                    className="w-full h-1 bg-slate-800 rounded appearance-none cursor-pointer accent-blue-500 focus:outline-none disabled:opacity-30 disabled:cursor-not-allowed"
+                                  />
+                                </div>
+                              </div>
+
+                              {/* Quick Zoom Buttons */}
+                              <div className="flex flex-wrap gap-1 border-t border-slate-900 pt-2">
+                                {([
+                                  { label: 'Full Session', secs: Math.round(parseResult.totalDurationMs / 1000) },
+                                  { label: '1m (60s)', secs: 60 },
+                                  { label: '30s', secs: 30 },
+                                  { label: '15s', secs: 15 },
+                                  { label: '5s', secs: 5 }
+                                ] as { label: string; secs: number }[]).map(btn => {
+                                  const totalSec = Math.round(parseResult.totalDurationMs / 1000);
+                                  const isSelected = zoomDurationSec === btn.secs || (btn.label === 'Full Session' && zoomDurationSec >= totalSec);
+                                  return (
+                                    <button
+                                      key={btn.label}
+                                      onClick={() => {
+                                        setZoomDurationSec(Math.min(totalSec, btn.secs));
+                                        if (btn.label === 'Full Session') setZoomPositionPct(0);
+                                      }}
+                                      className={`px-2 py-0.5 rounded text-[9px] font-bold uppercase tracking-wider transition-all font-mono border ${
+                                        isSelected
+                                          ? 'bg-blue-600 border-blue-500 text-white shadow-sm'
+                                          : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
+                                      }`}
+                                    >
+                                      {btn.label}
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Stacked Charts (full-width, vertically aligned) */}
+                        <div className="flex flex-col gap-4">
                             
-                            {/* Stacked Graph 1: Accelerometer (XYZ only) */}
+                            {/* Chart 1: Accelerometer (XYZ only) */}
                             <div className="bg-slate-900/50 border border-slate-800 p-4 rounded-lg flex flex-col gap-3">
                               <div className="flex items-center justify-between">
                                 <div className="flex items-center gap-2">
@@ -1293,17 +2150,56 @@ export default function App() {
                                 </span>
                               </div>
 
-                              <div className="h-[210px] w-full">
+                              {/* Annotation label bar above chart */}
+                              {annotationMarkers.length > 0 && (
+                                <div className="relative h-6 w-full ml-[20px] mr-[10px]" style={{ marginBottom: '-4px' }}>
+                                  {annotationMarkers.map((marker, idx) => {
+                                    const minT = graphData[0]?.timeOffset ?? 0;
+                                    const maxT = graphData[graphData.length - 1]?.timeOffset ?? 1;
+                                    const pct = ((marker.timeOffsetMs - minT) / (maxT - minT)) * 100;
+                                    if (pct < 0 || pct > 100) return null;
+                                    const isEditing = editingAnnotationIdx !== null && annotations.turns[editingAnnotationIdx] === marker.timeOffsetMs;
+                                    const originalIdx = annotations.turns.indexOf(marker.timeOffsetMs);
+                                    const isMatched = originalIdx >= 0 && matchedAnnotations[originalIdx];
+                                    return (
+                                      <button
+                                        key={`anno-label-xyz-${idx}`}
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setIsPlaying(false);
+                                          setEditingAnnotationIdx(originalIdx);
+                                          playheadRef.current = marker.timeOffsetMs;
+                                          setPlayheadMs(marker.timeOffsetMs);
+                                        }}
+                                        className={`absolute -translate-x-1/2 px-1.5 py-0.5 rounded text-[9px] font-bold font-mono cursor-pointer transition-all border ${
+                                          isEditing
+                                            ? 'bg-blue-500 border-blue-400 text-white shadow-lg shadow-blue-500/30 scale-110'
+                                            : isMatched
+                                              ? 'bg-emerald-800/80 border-emerald-500 text-emerald-200 hover:bg-emerald-700 hover:border-emerald-400'
+                                              : 'bg-blue-900/80 border-blue-600 text-blue-200 hover:bg-blue-800 hover:border-blue-400'
+                                        }`}
+                                        style={{ left: `${pct}%`, top: '2px' }}
+                                        title={`Annotation ${idx + 1} at ${formatTimeOffset(marker.timeOffsetMs)}${isMatched ? ' ✓ matched' : ' ✗ unmatched'} — click to edit`}
+                                      >
+                                        A{idx + 1}
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                              )}
+
+                              <div className="h-[210px] w-full" onClick={handleChartClick}>
                                 <ResponsiveContainer width="100%" height="100%">
                                   <LineChart
                                     data={graphData}
                                     syncId="swimSync"
                                     onMouseMove={(state: any) => {
                                       if (state && state.activePayload && state.activePayload.length > 0) {
-                                        setHoverReading(state.activePayload[0].payload as PebbleReading);
+                                        updateHoverReading(state.activePayload[0].payload as PebbleReading);
                                       }
                                     }}
                                     margin={{ top: 10, right: 10, left: -20, bottom: 0 }}
+                                    style={{ cursor: annotateMode ? 'crosshair' : 'default' }}
                                   >
                                     <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
                                     <XAxis 
@@ -1354,6 +2250,42 @@ export default function App() {
                                       />
                                     ))}
 
+                                    {/* Render Pause/Resume regions as wide light gray vertical bars */}
+                                    {pauseResumeMarkers.map((region, idx) => (
+                                      <ReferenceArea
+                                        key={`pause-xyz-${idx}`}
+                                        x1={region.x1}
+                                        x2={region.x2}
+                                        fill="#94a3b8"
+                                        fillOpacity={0.3}
+                                        stroke="#94a3b8"
+                                        strokeOpacity={0.5}
+                                      />
+                                    ))}
+
+                                    {/* Render Annotation markers as blue thick vertical lines */}
+                                    {annotationMarkers.map((marker, idx) => {
+                                      const isEditing = editingAnnotationIdx !== null && annotations.turns[editingAnnotationIdx] === marker.timeOffsetMs;
+                                      return (
+                                        <ReferenceLine
+                                          key={`anno-xyz-${idx}`}
+                                          x={marker.timeStr}
+                                          stroke={isEditing ? '#60a5fa' : '#3b82f6'}
+                                          strokeWidth={isEditing ? 6 : 4}
+                                        />
+                                      );
+                                    })}
+
+                                    {/* Playhead cursor line */}
+                                    {playheadMarker && (
+                                      <ReferenceLine
+                                        x={playheadMarker}
+                                        stroke="#fbbf24"
+                                        strokeWidth={2}
+                                        strokeDasharray="2 2"
+                                      />
+                                    )}
+
                                     <Line 
                                       type="monotone" 
                                       dataKey="x" 
@@ -1362,6 +2294,7 @@ export default function App() {
                                       strokeWidth={1.5} 
                                       dot={false}
                                       activeDot={{ r: 4 }}
+                                      isAnimationActive={!isPlaying}
                                     />
                                     <Line 
                                       type="monotone" 
@@ -1371,6 +2304,7 @@ export default function App() {
                                       strokeWidth={1.5} 
                                       dot={false}
                                       activeDot={{ r: 4 }}
+                                      isAnimationActive={!isPlaying}
                                     />
                                     <Line 
                                       type="monotone" 
@@ -1380,6 +2314,7 @@ export default function App() {
                                       strokeWidth={1.5} 
                                       dot={false}
                                       activeDot={{ r: 4 }}
+                                      isAnimationActive={!isPlaying}
                                     />
                                   </LineChart>
                                 </ResponsiveContainer>
@@ -1396,17 +2331,55 @@ export default function App() {
                                 <span className="text-[10px] font-mono text-slate-400">Total displacement G-force stress vectors</span>
                               </div>
 
-                              <div className="h-[140px] w-full">
+                              {/* Annotation label bar above magnitude chart */}
+                              {annotationMarkers.length > 0 && (
+                                <div className="relative h-5 w-full ml-[20px] mr-[10px]" style={{ marginBottom: '-2px' }}>
+                                  {annotationMarkers.map((marker, idx) => {
+                                    const minT = graphData[0]?.timeOffset ?? 0;
+                                    const maxT = graphData[graphData.length - 1]?.timeOffset ?? 1;
+                                    const pct = ((marker.timeOffsetMs - minT) / (maxT - minT)) * 100;
+                                    if (pct < 0 || pct > 100) return null;
+                                    const isEditing = editingAnnotationIdx !== null && annotations.turns[editingAnnotationIdx] === marker.timeOffsetMs;
+                                    const originalIdx = annotations.turns.indexOf(marker.timeOffsetMs);
+                                    const isMatched = originalIdx >= 0 && matchedAnnotations[originalIdx];
+                                    return (
+                                      <button
+                                        key={`anno-label-mag-${idx}`}
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setIsPlaying(false);
+                                          setEditingAnnotationIdx(originalIdx);
+                                          playheadRef.current = marker.timeOffsetMs;
+                                          setPlayheadMs(marker.timeOffsetMs);
+                                        }}
+                                        className={`absolute -translate-x-1/2 px-1 py-0.5 rounded text-[8px] font-bold font-mono cursor-pointer transition-all border ${
+                                          isEditing
+                                            ? 'bg-blue-500 border-blue-400 text-white shadow-lg shadow-blue-500/30'
+                                            : isMatched
+                                              ? 'bg-emerald-800/80 border-emerald-500 text-emerald-200 hover:bg-emerald-700'
+                                              : 'bg-blue-900/80 border-blue-600 text-blue-200 hover:bg-blue-800 hover:border-blue-400'
+                                        }`}
+                                        style={{ left: `${pct}%`, top: '1px' }}
+                                      >
+                                        A{idx + 1}
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                              )}
+
+                              <div className="h-[140px] w-full" onClick={handleChartClick}>
                                 <ResponsiveContainer width="100%" height="100%">
                                   <AreaChart
                                     data={graphData}
                                     syncId="swimSync"
                                     onMouseMove={(state: any) => {
                                       if (state && state.activePayload && state.activePayload.length > 0) {
-                                        setHoverReading(state.activePayload[0].payload as PebbleReading);
+                                        updateHoverReading(state.activePayload[0].payload as PebbleReading);
                                       }
                                     }}
                                     margin={{ top: 10, right: 10, left: -20, bottom: 0 }}
+                                    style={{ cursor: annotateMode ? 'crosshair' : 'default' }}
                                   >
                                     <defs>
                                       <linearGradient id="colorMagnitude" x1="0" y1="0" x2="0" y2="1">
@@ -1463,6 +2436,39 @@ export default function App() {
                                       />
                                     ))}
 
+                                    {/* Render Pause/Resume regions as wide light gray vertical bars */}
+                                    {pauseResumeMarkers.map((region, idx) => (
+                                      <ReferenceArea
+                                        key={`pause-mag-${idx}`}
+                                        x1={region.x1}
+                                        x2={region.x2}
+                                        fill="#94a3b8"
+                                        fillOpacity={0.3}
+                                        stroke="#94a3b8"
+                                        strokeOpacity={0.5}
+                                      />
+                                    ))}
+
+                                    {/* Render Annotation markers as blue thick vertical lines */}
+                                    {annotationMarkers.map((marker, idx) => (
+                                      <ReferenceLine
+                                        key={`anno-mag-${idx}`}
+                                        x={marker.timeStr}
+                                        stroke="#3b82f6"
+                                        strokeWidth={4}
+                                      />
+                                    ))}
+
+                                    {/* Playhead cursor line */}
+                                    {playheadMarker && (
+                                      <ReferenceLine
+                                        x={playheadMarker}
+                                        stroke="#fbbf24"
+                                        strokeWidth={2}
+                                        strokeDasharray="2 2"
+                                      />
+                                    )}
+
                                     <Area 
                                       type="monotone" 
                                       dataKey="magnitude" 
@@ -1472,6 +2478,7 @@ export default function App() {
                                       fill="url(#colorMagnitude)" 
                                       strokeWidth={1.5}
                                       activeDot={{ r: 4 }}
+                                      isAnimationActive={!isPlaying}
                                     />
                                   </AreaChart>
                                 </ResponsiveContainer>
@@ -1489,17 +2496,55 @@ export default function App() {
                                   <span className="text-[10px] font-mono text-slate-400">Heading degrees (0° - 360°)</span>
                                 </div>
 
-                                <div className="h-[140px] w-full">
+                                {/* Annotation label bar above compass chart */}
+                                {annotationMarkers.length > 0 && (
+                                  <div className="relative h-5 w-full ml-[20px] mr-[10px]" style={{ marginBottom: '-2px' }}>
+                                    {annotationMarkers.map((marker, idx) => {
+                                      const minT = graphData[0]?.timeOffset ?? 0;
+                                      const maxT = graphData[graphData.length - 1]?.timeOffset ?? 1;
+                                      const pct = ((marker.timeOffsetMs - minT) / (maxT - minT)) * 100;
+                                      if (pct < 0 || pct > 100) return null;
+                                      const isEditing = editingAnnotationIdx !== null && annotations.turns[editingAnnotationIdx] === marker.timeOffsetMs;
+                                      const originalIdx = annotations.turns.indexOf(marker.timeOffsetMs);
+                                      const isMatched = originalIdx >= 0 && matchedAnnotations[originalIdx];
+                                      return (
+                                        <button
+                                          key={`anno-label-compass-${idx}`}
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            setIsPlaying(false);
+                                            setEditingAnnotationIdx(originalIdx);
+                                            playheadRef.current = marker.timeOffsetMs;
+                                            setPlayheadMs(marker.timeOffsetMs);
+                                          }}
+                                          className={`absolute -translate-x-1/2 px-1 py-0.5 rounded text-[8px] font-bold font-mono cursor-pointer transition-all border ${
+                                            isEditing
+                                              ? 'bg-blue-500 border-blue-400 text-white shadow-lg shadow-blue-500/30'
+                                              : isMatched
+                                                ? 'bg-emerald-800/80 border-emerald-500 text-emerald-200 hover:bg-emerald-700'
+                                                : 'bg-blue-900/80 border-blue-600 text-blue-200 hover:bg-blue-800 hover:border-blue-400'
+                                          }`}
+                                          style={{ left: `${pct}%`, top: '1px' }}
+                                        >
+                                          A{idx + 1}
+                                        </button>
+                                      );
+                                    })}
+                                  </div>
+                                )}
+
+                                <div className="h-[140px] w-full" onClick={handleChartClick}>
                                   <ResponsiveContainer width="100%" height="100%">
                                     <AreaChart
                                       data={graphData}
                                       syncId="swimSync"
                                       onMouseMove={(state: any) => {
                                         if (state && state.activePayload && state.activePayload.length > 0) {
-                                          setHoverReading(state.activePayload[0].payload as PebbleReading);
+                                          updateHoverReading(state.activePayload[0].payload as PebbleReading);
                                         }
                                       }}
                                       margin={{ top: 10, right: 10, left: -20, bottom: 0 }}
+                                      style={{ cursor: annotateMode ? 'crosshair' : 'default' }}
                                     >
                                       <defs>
                                         <linearGradient id="colorCompass" x1="0" y1="0" x2="0" y2="1">
@@ -1558,6 +2603,39 @@ export default function App() {
                                         />
                                       ))}
 
+                                      {/* Render Pause/Resume regions as wide light gray vertical bars */}
+                                      {pauseResumeMarkers.map((region, idx) => (
+                                        <ReferenceArea
+                                          key={`pause-compass-${idx}`}
+                                          x1={region.x1}
+                                          x2={region.x2}
+                                          fill="#94a3b8"
+                                          fillOpacity={0.3}
+                                          stroke="#94a3b8"
+                                          strokeOpacity={0.5}
+                                        />
+                                      ))}
+
+                                      {/* Render Annotation markers as blue thick vertical lines */}
+                                      {annotationMarkers.map((marker, idx) => (
+                                        <ReferenceLine
+                                          key={`anno-compass-${idx}`}
+                                          x={marker.timeStr}
+                                          stroke="#3b82f6"
+                                          strokeWidth={4}
+                                        />
+                                      ))}
+
+                                      {/* Playhead cursor line */}
+                                      {playheadMarker && (
+                                        <ReferenceLine
+                                          x={playheadMarker}
+                                          stroke="#fbbf24"
+                                          strokeWidth={2}
+                                          strokeDasharray="2 2"
+                                        />
+                                      )}
+
                                       {/* Draw Compass Angle */}
                                       {parseResult.detectedFields.includes('heading') && (
                                         <Area 
@@ -1569,6 +2647,7 @@ export default function App() {
                                           fill="url(#colorCompass)" 
                                           strokeWidth={1.5}
                                           activeDot={{ r: 4 }}
+                                          isAnimationActive={!isPlaying}
                                         />
                                       )}
 
@@ -1582,6 +2661,7 @@ export default function App() {
                                           fillOpacity={0.1}
                                           strokeWidth={1.5}
                                           activeDot={{ r: 4 }}
+                                          isAnimationActive={!isPlaying}
                                         />
                                       )}
                                     </AreaChart>
@@ -1590,10 +2670,8 @@ export default function App() {
                               </div>
                             )}
 
-                          </div>
-
-                          {/* SVG Compass & Spatial 3D Orientation (Takes 4 cols) */}
-                          <div className="xl:col-span-4 bg-slate-900/50 border border-slate-800 p-4 rounded-lg flex flex-col gap-4">
+                          {/* Orientation Status (full-width below charts) */}
+                          <div className="bg-slate-900/50 border border-slate-800 p-4 rounded-lg flex flex-col gap-4">
                             <div className="flex items-center gap-2 border-b border-slate-800 pb-2">
                               <Compass className="h-3.5 w-3.5 text-rose-400" />
                               <h3 className="text-xs font-bold uppercase tracking-widest text-slate-100 font-sans">Orientation Status</h3>
@@ -1689,12 +2767,11 @@ export default function App() {
                               </div>
                             ) : (
                               <div className="flex-1 flex items-center justify-center text-center p-6 border border-dashed border-slate-800 rounded text-slate-500 text-[11px]">
-                                Hover over the graphs on the left to see dynamic orientation updates!
+                                Hover over the charts above to see dynamic orientation updates.
                               </div>
                             )}
 
                           </div>
-
                         </div>
 
                         {/* Interactive Inspection Table */}
