@@ -153,7 +153,26 @@ Pause events: `pause@9:03`
 
 ## Algorithm Change History
 
-### v3: Stroke-Interval + Glide + Y/Z Variance Secondary (July 17, 2026 — current)
+### v5: Combined Stroke-Interval + NCC Template Matching (July 17, 2026 — current)
+
+**Approach:** Union of two independent detectors:
+
+1. **Primary (from v3):** Stroke-interval gap analysis with glide validation. Best for freestyle where turn gap is 2-3× normal stroke interval.
+2. **Secondary (new):** Normalized Cross-Correlation template matching. A 61-sample template (±3s at 10Hz) built from 21 annotated turns is slid across the signal. Peaks above 0.25 threshold indicate turns. Best for breaststroke where timing gaps alone aren't distinctive.
+
+Combined output: union of both, with NCC turns only added if ≥22s from nearest primary turn. Post-filtered for minimum 20s lap duration.
+
+**Results (±4s match threshold):**
+
+| File | Expected Distance | v5 Distance | Lap Count Error |
+|------|-------------------|-------------|-----------------|
+| 152708 (freestyle) | 600m | 550-600m | 0 to −1 |
+| 163913 (breaststroke) | 250m | 200m | −1 |
+| 165824 (mixed) | 350m | 350m ✓ | 0 |
+
+See `reference/HANDOFF.md` for full details, C implementation, and integration guide.
+
+### v3: Stroke-Interval + Glide + Y/Z Variance Secondary (July 17, 2026)
 
 **Two-stage detection:**
 
@@ -211,6 +230,17 @@ Problems: wrong placement, requires compass, over/under detection.
 ## Algorithm Development Notes (AI Agent Handoff)
 
 Sister repo: `../pebble-swim-tracker/` (embedded C + watch simulator).
+
+### Reference C Implementation
+
+The `reference/` directory contains a complete fixed-point C implementation ready for porting to the Pebble:
+
+| File | Description |
+|------|-------------|
+| `reference/HANDOFF.md` | Full algorithm documentation, integration guide, memory/CPU budgets |
+| `reference/turn_detect_ncc.h` | C header — API, config defines, data structures |
+| `reference/turn_detect_ncc.c` | Fixed-point NCC implementation (Q8 arithmetic, ring buffer, ~500B flash + ~900B RAM) |
+| `src/lib/turnTemplate.json` | Template data (61 samples × 4 axes, built from 21 annotated turns) |
 
 ### Stroke Detection (unchanged)
 
