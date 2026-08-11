@@ -19,7 +19,22 @@ You can switch between them using the **Local / Drive** toggle in the header.
 
 ## Run Locally (Windows Desktop)
 
-**Prerequisites:** Node.js
+**Prerequisites:** Node.js (LTS)
+
+### Install Node.js (if not installed)
+
+```
+winget install OpenJS.NodeJS.LTS --accept-package-agreements --accept-source-agreements
+```
+
+Close and reopen your terminal after installation so the PATH updates.
+
+If behind a corporate proxy with self-signed certificates, configure npm:
+```
+npm config set strict-ssl false
+```
+
+### Run the app
 
 1. Install dependencies:
    ```
