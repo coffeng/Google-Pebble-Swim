@@ -54,6 +54,37 @@ import { parsePebbleJson, formatTimeOffset } from './lib/pebbleParser';
 
 type DataSource = 'local' | 'drive';
 
+/**
+ * Build the next AnnotationData while keeping the per-lap stroke labels aligned.
+ *
+ * `strokes` holds one label per segment, so its length must stay turns.length + 1.
+ * Every turn edit used to rebuild the object as `{ turns }` alone, which silently
+ * dropped the whole labels array — a single added or deleted turn wiped the stroke
+ * types for the entire session.
+ *
+ * insertAt: a turn was added, splitting one segment in two — the new segment
+ *           inherits the label of the segment it was split from.
+ * removeAt: a turn was deleted, merging two segments — drop the extra label.
+ * Neither:  a turn only moved, so the labels are unchanged.
+ */
+function withTurns(
+  prev: AnnotationData,
+  turns: number[],
+  opts: { insertAt?: number; removeAt?: number } = {}
+): AnnotationData {
+  if (!prev.strokes) return { turns };
+  const strokes = [...prev.strokes];
+  if (opts.insertAt !== undefined) {
+    const i = Math.max(0, Math.min(opts.insertAt, strokes.length - 1));
+    strokes.splice(i, 0, strokes[i] ?? 'unknown');
+  }
+  if (opts.removeAt !== undefined) {
+    strokes.splice(Math.max(0, Math.min(opts.removeAt, strokes.length - 1)), 1);
+  }
+  while (strokes.length < turns.length + 1) strokes.push('unknown');
+  return { turns, strokes: strokes.slice(0, turns.length + 1) };
+}
+
 // --- Swim Stroke Classifier ported from pebble-swim-tracker ---
 enum StrokeType {
   UNKNOWN = 0,
@@ -960,9 +991,9 @@ export default function App() {
     } else if (editingAnnotationIdx === null) {
       // Not in edit mode and not near existing — add new annotation
       const newTurns = [...annotations.turns, clickedTime].sort((a, b) => a - b);
-      const newAnnotations: AnnotationData = { turns: newTurns };
-      setAnnotations(newAnnotations);
       const newIdx = newTurns.indexOf(clickedTime);
+      const newAnnotations = withTurns(annotations, newTurns, { insertAt: newIdx });
+      setAnnotations(newAnnotations);
       setEditingAnnotationIdx(newIdx);
       setIsPlaying(false);
 
@@ -1063,10 +1094,10 @@ export default function App() {
     } else {
       // Add new and enter edit mode for it
       const newTurns = [...annotations.turns, currentTime].sort((a, b) => a - b);
-      const newAnnotations: AnnotationData = { turns: newTurns };
-      setAnnotations(newAnnotations);
       // Find the index of the newly added one
       const newIdx = newTurns.indexOf(currentTime);
+      const newAnnotations = withTurns(annotations, newTurns, { insertAt: newIdx });
+      setAnnotations(newAnnotations);
       setEditingAnnotationIdx(newIdx);
 
       if (dataSource === 'local' && selectedFile) {
@@ -1088,7 +1119,7 @@ export default function App() {
     const movedTime = Math.max(0, annotations.turns[editingAnnotationIdx] + shift);
     const newIdx = newTurns.indexOf(movedTime);
 
-    const newAnnotations: AnnotationData = { turns: newTurns };
+    const newAnnotations = withTurns(annotations, newTurns);
     setAnnotations(newAnnotations);
     setEditingAnnotationIdx(newIdx);
 
@@ -1119,7 +1150,7 @@ export default function App() {
   const deleteAnnotation = () => {
     if (editingAnnotationIdx === null) return;
     const newTurns = annotations.turns.filter((_, i) => i !== editingAnnotationIdx);
-    const newAnnotations: AnnotationData = { turns: newTurns };
+    const newAnnotations = withTurns(annotations, newTurns, { removeAt: editingAnnotationIdx });
     setAnnotations(newAnnotations);
     setEditingAnnotationIdx(null);
 
@@ -1959,12 +1990,13 @@ export default function App() {
                               <div className="flex flex-wrap gap-1.5">
                                 {Array.from({ length: annotations.turns.length + 1 }).map((_, lapIdx) => {
                                   const currentStroke = annotations.strokes?.[lapIdx] || 'freestyle';
-                                  const options: StrokeLabel[] = ['freestyle', 'breaststroke', 'backstroke', 'butterfly', 'unknown'];
+                                  const options: StrokeLabel[] = ['freestyle', 'breaststroke', 'backstroke', 'butterfly', 'pause', 'unknown'];
                                   const colors: Record<StrokeLabel, string> = {
                                     freestyle: 'text-pink-400 border-pink-700',
                                     breaststroke: 'text-amber-400 border-amber-700',
                                     backstroke: 'text-emerald-400 border-emerald-700',
                                     butterfly: 'text-purple-400 border-purple-700',
+                                    pause: 'text-sky-400 border-sky-700',
                                     unknown: 'text-slate-400 border-slate-700'
                                   };
                                   return (

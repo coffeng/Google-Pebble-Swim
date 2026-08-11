@@ -66,7 +66,13 @@ export async function downloadLocalFile(filename: string): Promise<any> {
 }
 
 
-export type StrokeLabel = 'freestyle' | 'breaststroke' | 'backstroke' | 'butterfly' | 'unknown';
+/** A segment label. 'pause' marks non-swimming time: the wait before the first
+ *  push-off, rest between sets, and the tail after the last length. 'unknown'
+ *  stays for swum segments whose stroke could not be identified. */
+export type StrokeLabel = 'freestyle' | 'breaststroke' | 'backstroke' | 'butterfly' | 'pause' | 'unknown';
+
+/** Labels that are not swimming, so callers can skip them when counting lengths. */
+export const NON_SWIM_LABELS: StrokeLabel[] = ['pause', 'unknown'];
 
 /**
  * Annotation data structure stored per file.
