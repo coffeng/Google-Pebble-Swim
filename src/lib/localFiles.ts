@@ -66,11 +66,14 @@ export async function downloadLocalFile(filename: string): Promise<any> {
 }
 
 
+export type StrokeLabel = 'freestyle' | 'breaststroke' | 'backstroke' | 'butterfly' | 'unknown';
+
 /**
  * Annotation data structure stored per file.
  */
 export interface AnnotationData {
   turns: number[]; // Array of timeOffsetMs values where turns are annotated
+  strokes?: StrokeLabel[]; // Dominating stroke type per lap (length = turns.length + 1)
 }
 
 /**

@@ -49,7 +49,7 @@ import {
   listPebbleJsonFiles, 
   downloadFileContent 
 } from './lib/googleDrive';
-import { isLocalServerAvailable, listLocalFiles, downloadLocalFile, loadAnnotations, saveAnnotations, AnnotationData } from './lib/localFiles';
+import { isLocalServerAvailable, listLocalFiles, downloadLocalFile, loadAnnotations, saveAnnotations, AnnotationData, StrokeLabel } from './lib/localFiles';
 import { parsePebbleJson, formatTimeOffset } from './lib/pebbleParser';
 
 type DataSource = 'local' | 'drive';
@@ -1520,9 +1520,8 @@ export default function App() {
                 ) : (
                   /* File List */
                   <div className="space-y-1.5 overflow-y-auto max-h-[360px] pr-1">
-                    {files.map((file, idx) => {
+                    {files.filter(f => !f.name.includes('annotations')).map((file) => {
                       const isSelected = selectedFile?.id === file.id;
-                      const isLongest = idx === 0; // First index is longest due to sorted order
                       return (
                         <button
                           key={file.id}
@@ -1555,13 +1554,8 @@ export default function App() {
                             </div>
                           </div>
 
-                          {/* Longest badge / selection indicator */}
+                          {/* Selection indicator */}
                           <div className="flex flex-col items-end gap-1 shrink-0">
-                            {isLongest ? (
-                              <span className="px-1 py-0.2 bg-amber-500/10 border border-amber-500/20 text-[8px] text-amber-400 rounded font-bold font-mono uppercase flex items-center gap-0.5 shadow-sm">
-                                <Flame className="h-2 w-2" /> Longest
-                              </span>
-                            ) : null}
                             {isSelected && (
                               <span className="h-1 w-1 bg-blue-400 rounded-full animate-ping"></span>
                             )}
@@ -1954,6 +1948,49 @@ export default function App() {
                                   ? <>Shortcuts: <kbd className="px-1 py-0.5 bg-slate-800 rounded text-slate-300">←</kbd><kbd className="px-1 py-0.5 bg-slate-800 rounded text-slate-300">→</kbd> nudge ±1s · <kbd className="px-1 py-0.5 bg-slate-800 rounded text-slate-300">Del</kbd> delete · <kbd className="px-1 py-0.5 bg-slate-800 rounded text-slate-300">Esc</kbd>/<kbd className="px-1 py-0.5 bg-slate-800 rounded text-slate-300">Space</kbd> done</>
                                   : <>Shortcuts: <kbd className="px-1 py-0.5 bg-slate-800 rounded text-slate-300">Space</kbd> play/pause · <kbd className="px-1 py-0.5 bg-slate-800 rounded text-slate-300">T</kbd> mark turn · Click blue line to edit</>
                                 }
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Stroke type per lap (visible when annotations exist in annotate mode) */}
+                          {annotateMode && annotations.turns.length > 0 && (
+                            <div className="bg-slate-950 p-3 rounded border border-slate-800/80 flex flex-col gap-2">
+                              <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider font-mono">Stroke Type per Lap</span>
+                              <div className="flex flex-wrap gap-1.5">
+                                {Array.from({ length: annotations.turns.length + 1 }).map((_, lapIdx) => {
+                                  const currentStroke = annotations.strokes?.[lapIdx] || 'freestyle';
+                                  const options: StrokeLabel[] = ['freestyle', 'breaststroke', 'backstroke', 'butterfly', 'unknown'];
+                                  const colors: Record<StrokeLabel, string> = {
+                                    freestyle: 'text-pink-400 border-pink-700',
+                                    breaststroke: 'text-amber-400 border-amber-700',
+                                    backstroke: 'text-emerald-400 border-emerald-700',
+                                    butterfly: 'text-purple-400 border-purple-700',
+                                    unknown: 'text-slate-400 border-slate-700'
+                                  };
+                                  return (
+                                    <div key={lapIdx} className="flex items-center gap-1">
+                                      <span className="text-[8px] font-mono text-slate-500">L{lapIdx + 1}</span>
+                                      <select
+                                        value={currentStroke}
+                                        onChange={(e) => {
+                                          const newStrokes = [...(annotations.strokes || Array(annotations.turns.length + 1).fill('freestyle'))];
+                                          while (newStrokes.length < annotations.turns.length + 1) newStrokes.push('freestyle');
+                                          newStrokes[lapIdx] = e.target.value as StrokeLabel;
+                                          const newAnnotations: AnnotationData = { ...annotations, strokes: newStrokes };
+                                          setAnnotations(newAnnotations);
+                                          if (dataSource === 'local' && selectedFile) {
+                                            saveAnnotations(selectedFile.id, newAnnotations).catch(console.error);
+                                          }
+                                        }}
+                                        className={`bg-slate-900 border rounded px-1 py-0.5 text-[9px] font-mono font-bold cursor-pointer ${colors[currentStroke]}`}
+                                      >
+                                        {options.map(o => (
+                                          <option key={o} value={o}>{o.slice(0, 4)}</option>
+                                        ))}
+                                      </select>
+                                    </div>
+                                  );
+                                })}
                               </div>
                             </div>
                           )}

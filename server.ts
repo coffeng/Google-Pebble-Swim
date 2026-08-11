@@ -55,7 +55,7 @@ app.get('/api/local/files', (_req, res) => {
           modifiedTime: stats.mtime.toISOString()
         };
       })
-      .sort((a, b) => b.size - a.size); // Sort by size descending (longest recording first)
+      .sort((a, b) => b.name.localeCompare(a.name)); // Sort by filename descending (newest date first)
 
     res.json({ files: jsonFiles });
   } catch (err: any) {
