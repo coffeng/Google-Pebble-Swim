@@ -1,7 +1,5 @@
 # Pebble Swim Data Explorer
 
-> Last updated: 2026-07-17
-
 A React app for visualizing Pebble smartwatch swim sensor data (accelerometer + compass). Includes stroke detection, turn detection, and stroke type classification.
 
 View in AI Studio: https://ai.studio/apps/ae12f1c7-8d16-4580-b80a-546832639f6f
@@ -10,10 +8,10 @@ View in AI Studio: https://ai.studio/apps/ae12f1c7-8d16-4580-b80a-546832639f6f
 
 The app supports two data sources, automatically selected based on your environment:
 
-| Mode | When | Data source |
-|------|------|-------------|
-| **Local** (default on desktop) | Local file server is detected | JSON files from disk |
-| **Google Drive** (default in AI Studio) | Local server unavailable | Files from your Google Drive `/pebble/` folder |
+| Mode                                          | When                          | Data source                                      |
+| --------------------------------------------- | ----------------------------- | ------------------------------------------------ |
+| **Local** (default on desktop)          | Local file server is detected | JSON files from disk                             |
+| **Google Drive** (default in AI Studio) | Local server unavailable      | Files from your Google Drive `/pebble/` folder |
 
 You can switch between them using the **Local / Drive** toggle in the header.
 
@@ -27,39 +25,46 @@ You can switch between them using the **Local / Drive** toggle in the header.
 winget install OpenJS.NodeJS.LTS --accept-package-agreements --accept-source-agreements
 ```
 
-Close and reopen your terminal after installation so the PATH updates.
+languageClose and reopen your terminal after installation so the PATH updates.
 
 If behind a corporate proxy with self-signed certificates, configure npm:
+
 ```
 npm config set strict-ssl false
 ```
 
-### Run the app
+language### Run the app
 
 1. Install dependencies:
+
    ```
    npm install
    ```
 
+   language
 2. Start both the local file server and the frontend:
+
    ```
    npm run dev:local
    ```
 
+   language
 3. Open **http://localhost:3000/** in your browser.
 
 The local file server reads JSON files from:
+
 ```
 C:\Users\100014430\Documents\GitHub\coffeng\pebble-swim-tracker\logs\PebbleSwimTracker
 ```
 
-To use a different folder, set the `PEBBLE_DATA_PATH` environment variable before starting:
+languageTo use a different folder, set the `PEBBLE_DATA_PATH` environment variable before starting:
+
 ```
 set PEBBLE_DATA_PATH=C:\path\to\your\json\files
 npm run dev:local
 ```
 
-No Google authentication is required in local mode — the app loads files directly from disk.
+languageNo Google authentication is required in local mode — the app loads files directly from disk.
 
 ## Run in Google AI Studio
 
@@ -71,15 +76,17 @@ The app runs as-is in AI Studio. It uses Firebase + Google OAuth to read JSON fi
    npm run dev
    ```
 
+   language
+
 ## Available Scripts
 
-| Script | Description |
-|--------|-------------|
-| `npm run dev:local` | Start local file server + Vite dev server (desktop use) |
-| `npm run dev` | Start Vite dev server only (AI Studio / Google Drive mode) |
-| `npm run server` | Start only the local file server on port 3001 |
-| `npm run build` | Production build |
-| `npm run preview` | Preview production build |
+| Script                | Description                                                |
+| --------------------- | ---------------------------------------------------------- |
+| `npm run dev:local` | Start local file server + Vite dev server (desktop use)    |
+| `npm run dev`       | Start Vite dev server only (AI Studio / Google Drive mode) |
+| `npm run server`    | Start only the local file server on port 3001              |
+| `npm run build`     | Production build                                           |
+| `npm run preview`   | Preview production build                                   |
 
 ## Expected JSON Format
 
@@ -99,7 +106,7 @@ The parser handles Pebble swim tracker JSON files with this structure:
 }
 ```
 
-Each entry in `raw` is `[x, y, z, compass_heading]`. The parser also supports object-based formats with named fields (`x`, `y`, `z`, `heading`, etc.).
+jsonEach entry in `raw` is `[x, y, z, compass_heading]`. The parser also supports object-based formats with named fields (`x`, `y`, `z`, `heading`, etc.).
 
 ### v19+ Format (July 2026+)
 
@@ -117,9 +124,10 @@ The `raw` array can contain interleaved event objects for pause/resume:
 }
 ```
 
-These are rendered as wide light-gray vertical bars on the charts.
+jsonThese are rendered as wide light-gray vertical bars on the charts.
 
 ---
+
 ## Annotated Swim Sessions (July 16, 2026)
 
 Ground-truth annotations for 3 valid pool recordings (50m pool). Annotations stored as `.annotations.json` sidecar files, created via GUI playback+annotate tool.
@@ -128,11 +136,11 @@ Ground-truth annotations for 3 valid pool recordings (50m pool). Annotations sto
 
 ### Distance Summary
 
-| File | Pool | Annotated Turns | Laps | Distance | v3 Algo Turns | v3 Laps | v3 Distance | Lap Count Error |
-|------|------|-----------------|------|----------|---------------|---------|-------------|-----------------|
-| swim-20260716-152708.json | 50m | 11 | 12 | 600m | ~13 | ~14 | 700m | +2 over |
-| swim-20260716-163913.json | 50m | 4 | 5 | 250m | ~3 | ~4 | 200m | −1 under |
-| swim-20260716-165824.json | 50m | 6 | 7 | 350m | ~5 | ~6 | 300m | −1 under |
+| File                      | Pool | Annotated Turns | Laps | Distance | v3 Algo Turns | v3 Laps | v3 Distance | Lap Count Error |
+| ------------------------- | ---- | --------------- | ---- | -------- | ------------- | ------- | ----------- | --------------- |
+| swim-20260716-152708.json | 50m  | 11              | 12   | 600m     | ~13           | ~14     | 700m        | +2 over         |
+| swim-20260716-163913.json | 50m  | 4               | 5    | 250m     | ~3            | ~4      | 200m        | −1 under       |
+| swim-20260716-165824.json | 50m  | 6               | 7    | 350m     | ~5            | ~6      | 300m        | −1 under       |
 
 ### Session 1: `swim-20260716-152708.json` (15:27 local)
 
@@ -179,11 +187,11 @@ Combined output: union of both, with NCC turns only added if ≥22s from nearest
 
 **Results (±4s match threshold):**
 
-| File | Expected Distance | v5 Distance | Lap Count Error |
-|------|-------------------|-------------|-----------------|
-| 152708 (freestyle) | 600m | 550-600m | 0 to −1 |
-| 163913 (breaststroke) | 250m | 200m | −1 |
-| 165824 (mixed) | 350m | 350m ✓ | 0 |
+| File                  | Expected Distance | v5 Distance | Lap Count Error |
+| --------------------- | ----------------- | ----------- | --------------- |
+| 152708 (freestyle)    | 600m              | 550-600m    | 0 to −1        |
+| 163913 (breaststroke) | 250m              | 200m        | −1             |
+| 165824 (mixed)        | 350m              | 350m ✓     | 0               |
 
 See `reference/HANDOFF.md` for full details, C implementation, and integration guide.
 
@@ -192,6 +200,7 @@ See `reference/HANDOFF.md` for full details, C implementation, and integration g
 **Two-stage detection:**
 
 **Stage 1 (Primary):** Stroke-interval gap analysis
+
 1. Detect strokes via magnitude peak detection
 2. Compute inter-stroke intervals, exclude pause regions
 3. Score each interval = gap / P15(nearby 4 intervals)
@@ -200,6 +209,7 @@ See `reference/HANDOFF.md` for full details, C implementation, and integration g
 6. Post-filter: minimum 22s between turns, minimum 20s lap duration
 
 **Stage 2 (Secondary):** Y+Z variance spike detector (catches breaststroke turns)
+
 1. Compute Y std + Z std in 1.5s sliding windows (0.5s step)
 2. Also track Z range (max−min) and magnitude minimum per window
 3. Detect spikes where either:
@@ -209,26 +219,26 @@ See `reference/HANDOFF.md` for full details, C implementation, and integration g
 
 **Parameters:**
 
-| Parameter | Value | Stage |
-|-----------|-------|-------|
-| MEDIAN_WINDOW | 4 | Primary |
-| MIN_TURN_GAP_RATIO | 1.3 | Primary |
-| MIN_TURN_GAP_ABS | 1800ms | Primary |
-| MIN_TURN_INTERVAL | 22000ms | Both |
-| GLIDE_THRESHOLD | 0.88 | Primary |
-| MIN_LAP_DURATION | 20000ms | Post-filter |
-| PERCENTILE | 0.15 | Primary |
-| SEC_COMBINED_RATIO | 1.55 | Secondary |
-| SEC_ZRANGE_RATIO | 1.4 | Secondary |
+| Parameter          | Value   | Stage       |
+| ------------------ | ------- | ----------- |
+| MEDIAN_WINDOW      | 4       | Primary     |
+| MIN_TURN_GAP_RATIO | 1.3     | Primary     |
+| MIN_TURN_GAP_ABS   | 1800ms  | Primary     |
+| MIN_TURN_INTERVAL  | 22000ms | Both        |
+| GLIDE_THRESHOLD    | 0.88    | Primary     |
+| MIN_LAP_DURATION   | 20000ms | Post-filter |
+| PERCENTILE         | 0.15    | Primary     |
+| SEC_COMBINED_RATIO | 1.55    | Secondary   |
+| SEC_ZRANGE_RATIO   | 1.4     | Secondary   |
 
 **Results (±4s match threshold):**
 
-| File | Matched/Total | Missed | Extra | Accuracy |
-|------|---------------|--------|-------|----------|
-| 152708 (freestyle) | 10/11 | 1 | ~3 | 91% |
-| 163913 (breaststroke) | 2/4 | 2 | ~2 | 50% |
-| 165824 (mixed) | 4/6 | 2 | ~1 | 67% |
-| **Total** | **16/21** | **5** | **~6** | **76%** |
+| File                  | Matched/Total   | Missed      | Extra        | Accuracy      |
+| --------------------- | --------------- | ----------- | ------------ | ------------- |
+| 152708 (freestyle)    | 10/11           | 1           | ~3           | 91%           |
+| 163913 (breaststroke) | 2/4             | 2           | ~2           | 50%           |
+| 165824 (mixed)        | 4/6             | 2           | ~1           | 67%           |
+| **Total**       | **16/21** | **5** | **~6** | **76%** |
 
 ### v2: Stroke-Interval + Glide (July 17, 2026)
 
@@ -250,12 +260,12 @@ Sister repo: `../pebble-swim-tracker/` (embedded C + watch simulator).
 
 The `reference/` directory contains a complete fixed-point C implementation ready for porting to the Pebble:
 
-| File | Description |
-|------|-------------|
-| `reference/HANDOFF.md` | Full algorithm documentation, integration guide, memory/CPU budgets |
-| `reference/turn_detect_ncc.h` | C header — API, config defines, data structures |
+| File                            | Description                                                                          |
+| ------------------------------- | ------------------------------------------------------------------------------------ |
+| `reference/HANDOFF.md`        | Full algorithm documentation, integration guide, memory/CPU budgets                  |
+| `reference/turn_detect_ncc.h` | C header — API, config defines, data structures                                     |
 | `reference/turn_detect_ncc.c` | Fixed-point NCC implementation (Q8 arithmetic, ring buffer, ~500B flash + ~900B RAM) |
-| `src/lib/turnTemplate.json` | Template data (61 samples × 4 axes, built from 21 annotated turns) |
+| `src/lib/turnTemplate.json`   | Template data (61 samples × 4 axes, built from 21 annotated turns)                  |
 
 ### Stroke Detection (unchanged)
 
@@ -278,18 +288,21 @@ See Algorithm Change History above.
 ### Key Findings from Visual Annotation
 
 **What a real turn looks like in the signal:**
+
 1. Last stroke of lap ends → glide phase (magnitude drops toward 1000mG)
 2. Turn itself: 2-3 rapid Y oscillations (higher freq than stroke rhythm) + Z dives deep
 3. Push-off glide (another quiet phase)
 4. First stroke of new lap resumes
 
 **Why breaststroke turns remain hardest:**
+
 - Normal inter-stroke interval: 2.5-3.0s (vs freestyle 0.8-1.5s)
 - Turn gap: 3.5-5.0s → only 1.3-1.8× normal rhythm (below reliable detection)
 - Must rely on Y/Z axis pattern changes rather than timing gaps alone
 - The Y-oscillation burst and Z-dive ARE visible but subtle at 10Hz
 
 **Remaining missed turns (5 of 21):**
+
 - File 1 @889s: Last breaststroke turn before pause. Low contrast against irregullar end-of-swim activity.
 - File 2 @102s: First breaststroke turn. Swimmer still settling into rhythm — no clear baseline yet.
 - File 2 @357s: Last turn before stopping. Post-turn activity drops to zero (rest), breaking pattern assumptions.
@@ -297,6 +310,7 @@ See Algorithm Change History above.
 - File 3 @531s: Last freestyle turn. Similar to file 2 @357s — activity drops after.
 
 **False positive pattern:**
+
 - Mid-freestyle peaks with high Y-crossing rate but normal Z range
 - Stroke-interval gaps in breaststroke that meet 1.3× but aren't wall touches
 - Post-pause/cooldown irregularities
